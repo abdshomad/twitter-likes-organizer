@@ -2,7 +2,7 @@ import json
 import os
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Awaitable
 from playwright.async_api import async_playwright
 
 DEFAULT_DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
@@ -133,8 +133,12 @@ class PlaywrightXScraper:
                 await browser.close()
                 return {"status": "error", "message": f"Login failed: {str(e)}"}
 
-    async def scrape_likes(self, username: str = "", max_tweets: int = 0) -> list[dict[str, Any]]:
-        """Scrapes likes timeline with uncapped infinite scrolling until 5 consecutive empty checks."""
+    async def scrape_likes(
+        self,
+        username: str = "",
+        max_tweets: int = 0,
+        on_progress: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> list[dict[str, Any]]:
         self._ensure_restored()
         target = self.session_path if self.session_path.exists() else self.backup_path
         if not target.exists():
@@ -176,9 +180,10 @@ class PlaywrightXScraper:
 
             consecutive_empty = 0
             last_height = 0
+            scroll_count = 0
 
-            # Infinite scroll loop until 5 consecutive empty checks or max_tweets reached
             while True:
+                scroll_count += 1
                 initial_count = len(extracted_tweets)
                 articles = await page.locator("article[data-testid='tweet']").all()
                 for article in articles:
@@ -226,15 +231,22 @@ class PlaywrightXScraper:
                     except Exception:
                         continue
 
+                current_height = await page.evaluate("document.body.scrollHeight")
+                if on_progress:
+                    await on_progress({
+                        "stage": "scrolling",
+                        "scroll_attempt": scroll_count,
+                        "tweets_found": len(extracted_tweets),
+                        "height": current_height,
+                        "page_url": page.url,
+                    })
+
                 if max_tweets > 0 and len(extracted_tweets) >= max_tweets:
                     break
 
-                # Scroll down
-                current_height = await page.evaluate("document.body.scrollHeight")
                 await page.evaluate("window.scrollBy(0, window.innerHeight * 2);")
                 await page.wait_for_timeout(1000)
 
-                # Check if new tweets were added or page height increased
                 if len(extracted_tweets) == initial_count and current_height == last_height:
                     consecutive_empty += 1
                     if consecutive_empty >= 5:

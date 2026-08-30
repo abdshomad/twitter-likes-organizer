@@ -1,5 +1,6 @@
+import asyncio
 import json
-from typing import AsyncGenerator, Any
+from typing import AsyncGenerator
 from src.storage.lancedb_client import LanceDBStore
 from src.ai.tagger import AITagger
 from src.ai.embedder import VectorEmbedder
@@ -23,8 +24,31 @@ async def stream_likes_sync(
 
     yield f"data: {json.dumps({'stage': 'scraping', 'percent': 5, 'message': 'Connecting to Twitter timeline...'})}\n\n"
     
+    event_queue = asyncio.Queue()
+
+    async def on_progress(data: dict):
+        await event_queue.put(data)
+
+    async def run_scraper():
+        try:
+            return await scraper.scrape_likes(username=username, max_tweets=max_tweets, on_progress=on_progress)
+        finally:
+            await event_queue.put({"stage": "scrape_finished"})
+
+    scrape_task = asyncio.create_task(run_scraper())
+
+    # Stream real-time scrolling telemetry as it happens
+    while not scrape_task.done() or not event_queue.empty():
+        try:
+            event = await asyncio.wait_for(event_queue.get(), timeout=0.2)
+            if event.get("stage") == "scrape_finished":
+                break
+            yield f"data: {json.dumps(event)}\n\n"
+        except asyncio.TimeoutError:
+            continue
+
     try:
-        tweets = await scraper.scrape_likes(username=username, max_tweets=max_tweets)
+        tweets = await scrape_task
     except Exception as e:
         yield f"data: {json.dumps({'error': f'Failed to scrape: {str(e)}', 'stage': 'error'})}\n\n"
         return
@@ -34,19 +58,16 @@ async def stream_likes_sync(
         yield f"data: {json.dumps({'stage': 'complete', 'percent': 100, 'message': 'No new likes found.', 'inserted': 0})}\n\n"
         return
 
-    yield f"data: {json.dumps({'stage': 'processing', 'percent': 10, 'total': total, 'message': f'Found {total} likes. Ingesting...'})}\n\n"
+    yield f"data: {json.dumps({'stage': 'processing', 'percent': 20, 'total': total, 'message': f'Found {total} likes. Ingesting...'})}\n\n"
 
     processed = []
     for idx, tweet in enumerate(tweets, start=1):
-        # 1. Media
         media_paths = downloader.download_tweet_media(tweet)
         tweet["local_media_paths"] = media_paths
 
-        # 2. AI Tags
         tags = tagger.generate_tags(tweet["text"])
         tweet["tags"] = tags
 
-        # 3. Vector embedding
         try:
             tweet["vector"] = embedder.embed_text(tweet["text"])
         except Exception:
@@ -55,7 +76,7 @@ async def stream_likes_sync(
         store.upsert_tweets([tweet])
         processed.append(tweet)
 
-        percent = int(10 + (idx / total) * 85)
+        percent = int(20 + (idx / total) * 75)
         event_data = {
             "stage": "item_done",
             "current": idx,

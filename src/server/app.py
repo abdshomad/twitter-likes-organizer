@@ -102,7 +102,7 @@ async def auth_launch_browser(bg: BackgroundTasks):
 
 
 @app.get("/api/sync/stream")
-async def sync_stream(max_tweets: int = 50, username: str = ""):
+async def sync_stream(max_tweets: int = 0, username: str = ""):
     return StreamingResponse(
         stream_likes_sync(scraper, store, tagger, embedder, downloader, username, max_tweets),
         media_type="text/event-stream",
@@ -352,7 +352,7 @@ async def index():
       feed.innerHTML = '';
       btn.disabled = true; btn.innerText = 'Syncing...';
 
-      const es = new EventSource('/api/sync/stream?max_tweets=50');
+      const es = new EventSource('/api/sync/stream?max_tweets=0');
       es.onmessage = function(e) {{
         const data = JSON.parse(e.data);
         if (data.error) {{
@@ -363,18 +363,21 @@ async def index():
           if (data.error.includes('connect')) openAuthModal();
           return;
         }}
-        if (data.percent !== undefined) {{
-          progressFill.style.width = data.percent + '%';
-          percentText.innerText = data.percent + '%';
-        }}
-        if (data.stage === 'scraping') {{
-          statusTitle.innerText = data.message || 'Scraping timeline...';
-          feed.innerHTML += `<div>[1/4] ${{data.message}}</div>`;
+        if (data.stage === 'scrolling') {{
+          statusTitle.innerText = `[Scroll #${{data.scroll_attempt}}] Scraped ${{data.tweets_found}} likes...`;
+          feed.innerHTML += `<div>[Scroll #${{data.scroll_attempt}}] ${{data.page_url}} | Found: <strong style="color:#10b981;">${{data.tweets_found}}</strong> likes (Height: ${{data.height}}px)</div>`;
+          feed.scrollTop = feed.scrollHeight;
         }} else if (data.stage === 'item_done') {{
+          if (data.percent !== undefined) {{
+            progressFill.style.width = data.percent + '%';
+            percentText.innerText = data.percent + '%';
+          }}
           statusTitle.innerText = `Ingesting (${{data.current}}/${{data.total}})...`;
           feed.innerHTML += `<div>[Ingested] <strong style="color:var(--primary)">@${{data.author_handle || 'user'}}</strong>: "${{data.text}}" <span style="color:#10b981;">[${{data.tags.join(', ')}}]</span></div>`;
           feed.scrollTop = feed.scrollHeight;
         }} else if (data.stage === 'complete') {{
+          progressFill.style.width = '100%';
+          percentText.innerText = '100%';
           statusTitle.innerText = 'Sync Complete!';
           feed.innerHTML += `<div style="color:#10b981; font-weight:bold;">[DONE] ${{data.message}}</div>`;
           es.close();
