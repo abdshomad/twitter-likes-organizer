@@ -81,13 +81,34 @@ class TwitterUnliker:
                     return True, 200
             return False, r.status_code
 
+    async def unlike_tweet_rest(self, tweet_id: str) -> tuple[bool, int]:
+        headers = self._get_auth_headers()
+        headers["content-type"] = "application/x-www-form-urlencoded"
+        url = "https://x.com/i/api/1.1/favorites/destroy.json"
+        async with AsyncSession(impersonate="chrome120") as s:
+            r = await s.post(url, headers=headers, data={"id": str(tweet_id)}, timeout=15)
+            if r.status_code == 200:
+                return True, 200
+            return False, r.status_code
+
     async def ensure_unliked(self, tweet_id: str, tweet_url: str = "", max_attempts: int = 3) -> tuple[bool, str]:
         for attempt in range(1, max_attempts + 1):
             try:
                 success, status_code = await self.unlike_tweet_graphql(tweet_id)
                 if success:
-                    return True, "graphql"
-                if status_code == 429:
+                    # Also send REST destroy to clear legacy cluster cache
+                    try:
+                        await self.unlike_tweet_rest(tweet_id)
+                    except Exception:
+                        pass
+                    return True, "graphql+rest"
+                
+                # Fallback to REST destroy
+                rest_ok, rest_code = await self.unlike_tweet_rest(tweet_id)
+                if rest_ok:
+                    return True, "rest"
+
+                if status_code == 429 or rest_code == 429:
                     await asyncio.sleep(4.0)
             except Exception:
                 pass
