@@ -25,6 +25,7 @@ class BackgroundSyncScheduler:
         embedder: VectorEmbedder,
         media_queue: MediaQueue,
         interval_sec: int = 300,
+        on_telemetry_event: Any = None,
     ):
         self.scraper = scraper
         self.gql_client = TwitterGraphQLClient(scraper.session_path)
@@ -35,6 +36,7 @@ class BackgroundSyncScheduler:
         self.tagger = tagger
         self.embedder = embedder
         self.interval_sec = interval_sec
+        self.on_telemetry_event = on_telemetry_event
         self.enabled = True
         self.auto_unlike = True
         self.is_running = False
@@ -143,6 +145,18 @@ class BackgroundSyncScheduler:
                     self.store.upsert_tweets([tweet])
                     existing_ids.add(tid)
                     inserted_count += 1
+
+                    if self.on_telemetry_event:
+                        try:
+                            await self.on_telemetry_event("new_like", {
+                                "tweet_id": tid,
+                                "author_handle": tweet.get("author_handle", ""),
+                                "author_name": tweet.get("author_name", ""),
+                                "text": tweet.get("text", "")[:120],
+                                "favorite_count": tweet.get("favorite_count", 0),
+                            })
+                        except Exception:
+                            pass
 
             uname = status.get("username", "")
             try:

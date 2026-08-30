@@ -70,3 +70,14 @@ async def test_delete_tweets_endpoints():
         res2 = await client.post("/api/tweets/bulk-delete", json={"tweet_ids": ["999998", "999997"]})
         assert res2.status_code == 200
         assert res2.json()["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_telemetry_stream_endpoint():
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get("/api/telemetry/stream")
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers.get("content-type", "")
+

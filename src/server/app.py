@@ -5,7 +5,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
-from fastapi import FastAPI, UploadFile, File, Query, BackgroundTasks, Body
+from fastapi import FastAPI, UploadFile, File, Query, BackgroundTasks, Body, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from src.server.config import HOST, PORT, DATA_DIR, MEDIA_DIR
@@ -25,6 +25,32 @@ from src.ingestion.author_hydrator import AuthorHydrator
 from src.ingestion.metrics_enricher import TweetMetricsEnricher
 from src.ingestion.background_sync import BackgroundSyncScheduler
 
+
+class TelemetryBroadcaster:
+    def __init__(self):
+        self.subscribers: set[asyncio.Queue] = set()
+
+    async def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue(maxsize=100)
+        self.subscribers.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue):
+        self.subscribers.discard(q)
+
+    async def broadcast(self, event_type: str, data: dict[str, Any]):
+        msg = f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+        for q in list(self.subscribers):
+            try:
+                q.put_nowait(msg)
+            except asyncio.QueueFull:
+                pass
+            except Exception:
+                self.subscribers.discard(q)
+
+
+telemetry_broadcaster = TelemetryBroadcaster()
+
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 store = LanceDBStore()
 history = HistoryManager()
@@ -34,7 +60,9 @@ rag_chat = RAGChatEngine(store=store, embedder=embedder)
 media_queue = MediaQueue(store=store)
 scraper = PlaywrightXScraper()
 unliker = TwitterUnliker(scraper.session_path)
-scheduler = BackgroundSyncScheduler(scraper, store, tagger, embedder, media_queue, interval_sec=600)
+scheduler = BackgroundSyncScheduler(
+    scraper, store, tagger, embedder, media_queue, interval_sec=300, on_telemetry_event=telemetry_broadcaster.broadcast
+)
 author_hydrator = AuthorHydrator(store=store)
 metrics_enricher = TweetMetricsEnricher(store=store)
 
@@ -100,6 +128,54 @@ async def auth_status():
 @app.get("/api/scheduler/status")
 async def scheduler_status():
     return scheduler.get_status()
+
+
+@app.get("/api/telemetry/stream")
+async def telemetry_stream(request: Request):
+    async def event_generator():
+        q = await telemetry_broadcaster.subscribe()
+        try:
+            # Emit immediate initial snapshot
+            stats = store.get_stats()
+            stats["media_queue"] = media_queue.get_status()
+            sched = scheduler.get_status()
+            tags = store.get_all_tags()
+            initial_data = {
+                "stats": stats,
+                "scheduler": sched,
+                "tags_count": len(tags),
+            }
+            yield f"event: stats\ndata: {json.dumps(initial_data)}\n\n"
+
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    msg = await asyncio.wait_for(q.get(), timeout=8.0)
+                    yield msg
+                except asyncio.TimeoutError:
+                    stats = store.get_stats()
+                    stats["media_queue"] = media_queue.get_status()
+                    sched = scheduler.get_status()
+                    heartbeat_data = {
+                        "stats": stats,
+                        "scheduler": sched,
+                        "tags_count": len(store.get_all_tags()),
+                        "timestamp": time.time(),
+                    }
+                    yield f"event: heartbeat\ndata: {json.dumps(heartbeat_data)}\n\n"
+        finally:
+            telemetry_broadcaster.unsubscribe(q)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/api/scheduler/toggle")
@@ -275,6 +351,11 @@ async def delete_single_tweet(tweet_id: str):
     deleted = store.delete_tweets([tweet_id])
     cleanup_local_media([tweet_id])
     history.add_notification("info", "Deleted Tweet", f"Removed tweet #{tweet_id} and local media.")
+    await telemetry_broadcaster.broadcast("stats", {
+        "stats": store.get_stats(),
+        "scheduler": scheduler.get_status(),
+        "tags_count": len(store.get_all_tags()),
+    })
     return {"status": "success", "tweet_id": tweet_id, "deleted": deleted}
 
 
@@ -286,6 +367,11 @@ async def bulk_delete_tweets(payload: dict[str, Any] = Body(...)):
     deleted = store.delete_tweets(tweet_ids)
     cleanup_local_media(tweet_ids)
     history.add_notification("info", "Bulk Deleted Likes", f"Removed {deleted} tweets and associated media.")
+    await telemetry_broadcaster.broadcast("stats", {
+        "stats": store.get_stats(),
+        "scheduler": scheduler.get_status(),
+        "tags_count": len(store.get_all_tags()),
+    })
     return {"status": "success", "deleted_count": deleted}
 
 
@@ -299,6 +385,11 @@ async def ingest_archive(file: UploadFile = File(...)):
     inserted = store.upsert_tweets(tweets)
     total_db = store.get_stats().get("total_likes", 0)
     history.add_sync_log("archive-upload", "parser", "success", len(tweets), total_db, "Imported like.js archive.")
+    await telemetry_broadcaster.broadcast("stats", {
+        "stats": store.get_stats(),
+        "scheduler": scheduler.get_status(),
+        "tags_count": len(store.get_all_tags()),
+    })
     return {"status": "success", "parsed": len(tweets), "inserted": inserted}
 
 
@@ -572,9 +663,56 @@ async def index():
       
       .hud-floating-toast {{ left: 1rem; right: 1rem; width: auto; bottom: 1rem; }}
     }}
+
+    @keyframes statPulse {{
+      0% {{ transform: scale(1); color: inherit; }}
+      50% {{ transform: scale(1.15); color: #38bdf8; text-shadow: 0 0 10px rgba(56, 189, 248, 0.6); }}
+      100% {{ transform: scale(1); color: inherit; }}
+    }}
+    .stat-pulsing {{
+      animation: statPulse 0.6s ease-out;
+    }}
+    @keyframes pillBounce {{
+      0% {{ transform: translate(-50%, -20px); opacity: 0; }}
+      60% {{ transform: translate(-50%, 4px); opacity: 1; }}
+      100% {{ transform: translate(-50%, 0); opacity: 1; }}
+    }}
+    #hud-new-likes-pill {{
+      position: fixed;
+      top: 68px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 90;
+      background: linear-gradient(135deg, rgba(29,155,240,0.95), rgba(56,189,248,0.95));
+      backdrop-filter: blur(12px);
+      color: #ffffff;
+      font-weight: 700;
+      font-size: 0.85rem;
+      padding: 7px 16px;
+      border-radius: 30px;
+      box-shadow: 0 8px 24px rgba(29,155,240,0.45);
+      cursor: pointer;
+      display: none;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid rgba(255,255,255,0.3);
+      animation: pillBounce 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+      transition: transform 0.15s ease, box-shadow 0.15s ease;
+    }}
+    #hud-new-likes-pill:hover {{
+      transform: translateX(-50%) scale(1.04);
+      box-shadow: 0 10px 28px rgba(29,155,240,0.6);
+    }}
   </style>
 </head>
 <body>
+  <!-- Floating New Likes Pill -->
+  <div id="hud-new-likes-pill" onclick="refreshFeedFromPill()">
+    <span>✨</span>
+    <span id="hud-new-likes-text">+1 new like synced</span>
+    <span style="font-size:0.75rem; opacity:0.85; margin-left:2px;">(Click to view)</span>
+  </div>
+
   <!-- Pure HUD Floating Topbar -->
   <header class="hud-topbar">
     <div style="display:flex; align-items:center; gap:10px;">
@@ -1632,27 +1770,131 @@ async def index():
       nextSyncSeconds = data.scheduler.next_sync_in_sec || sec;
     }}
 
+    let newLikesCountDuringSession = 0;
+
+    function animateTickerPulse(el) {{
+      if (!el) return;
+      el.classList.remove('stat-pulsing');
+      void el.offsetWidth; // trigger reflow
+      el.classList.add('stat-pulsing');
+    }}
+
+    function handleTelemetryUpdate(data) {{
+      if (!data) return;
+      const st = data.stats;
+      if (st) {{
+        const statTotal = document.getElementById('stat-total');
+        const statMedia = document.getElementById('stat-media');
+        const statTags = document.getElementById('stat-tags');
+        if (statTotal && st.total_likes !== undefined && statTotal.innerText !== String(st.total_likes)) {{
+          statTotal.innerText = st.total_likes;
+          animateTickerPulse(statTotal);
+        }}
+        if (statMedia && st.archived_media_files !== undefined && statMedia.innerText !== String(st.archived_media_files)) {{
+          statMedia.innerText = st.archived_media_files;
+          animateTickerPulse(statMedia);
+        }}
+        if (statTags && (st.tags_count !== undefined || data.tags_count !== undefined)) {{
+          const tc = st.tags_count !== undefined ? st.tags_count : data.tags_count;
+          if (statTags.innerText !== String(tc)) {{
+            statTags.innerText = tc;
+            animateTickerPulse(statTags);
+          }}
+        }}
+      }}
+
+      const sched = data.scheduler;
+      if (sched) {{
+        isSyncEnabled = sched.enabled;
+        syncInterval = sched.interval_sec;
+        const cd = document.getElementById('sync-countdown');
+        if (cd) {{
+          if (sched.is_running) {{
+            cd.innerText = 'Syncing...';
+            cd.style.color = '#a855f7';
+          }} else if (!isSyncEnabled || syncInterval === 0) {{
+            cd.innerText = isSyncEnabled ? 'Manual' : 'Paused';
+            cd.style.color = '#38bdf8';
+          }} else if (sched.next_sync_in_sec !== undefined) {{
+            nextSyncSeconds = sched.next_sync_in_sec;
+            const m = Math.floor(nextSyncSeconds / 60);
+            const s = nextSyncSeconds % 60;
+            cd.innerText = `Next: ${{m.toString().padStart(2, '0')}}:${{s.toString().padStart(2, '0')}}`;
+            cd.style.color = '#38bdf8';
+          }}
+        }}
+      }}
+    }}
+
+    function showNewLikesPill(count) {{
+      const pill = document.getElementById('hud-new-likes-pill');
+      const text = document.getElementById('hud-new-likes-text');
+      if (pill && text) {{
+        text.innerText = `+${{count}} new like${{count > 1 ? 's' : ''}} synced`;
+        pill.style.display = 'flex';
+      }}
+    }}
+
+    function refreshFeedFromPill() {{
+      const pill = document.getElementById('hud-new-likes-pill');
+      if (pill) pill.style.display = 'none';
+      newLikesCountDuringSession = 0;
+      searchCache.clear();
+      refreshStats();
+      loadLikes(false);
+      window.scrollTo({{ top: 0, behavior: 'smooth' }});
+    }}
+
+    let sseSource = null;
+    function connectTelemetryStream() {{
+      if (sseSource) {{
+        try {{ sseSource.close(); }} catch (e) {{}}
+      }}
+      try {{
+        sseSource = new EventSource('/api/telemetry/stream');
+        sseSource.addEventListener('stats', (e) => {{
+          try {{
+            const data = JSON.parse(e.data);
+            handleTelemetryUpdate(data);
+          }} catch (err) {{}}
+        }});
+        sseSource.addEventListener('heartbeat', (e) => {{
+          try {{
+            const data = JSON.parse(e.data);
+            handleTelemetryUpdate(data);
+          }} catch (err) {{}}
+        }});
+        sseSource.addEventListener('new_like', (e) => {{
+          try {{
+            const item = JSON.parse(e.data);
+            newLikesCountDuringSession++;
+            showNewLikesPill(newLikesCountDuringSession);
+            const statTotal = document.getElementById('stat-total');
+            if (statTotal) {{
+              const cur = parseInt(statTotal.innerText.replace(/,/g, '')) || 0;
+              statTotal.innerText = cur + 1;
+              animateTickerPulse(statTotal);
+            }}
+          }} catch (err) {{}}
+        }});
+        sseSource.onerror = () => {{
+          try {{ sseSource.close(); }} catch (e) {{}}
+          setTimeout(connectTelemetryStream, 6000);
+        }};
+      }} catch (e) {{
+        setTimeout(connectTelemetryStream, 6000);
+      }}
+    }}
+
     async function refreshStats() {{
       try {{
         const res = await fetch('/api/stats');
         const st = await res.json();
-        const statTotal = document.getElementById('stat-total');
-        const statMedia = document.getElementById('stat-media');
-        const statTags = document.getElementById('stat-tags');
-        if (statTotal && st.total_likes !== undefined) statTotal.innerText = st.total_likes;
-        if (statMedia && st.archived_media_files !== undefined) statMedia.innerText = st.archived_media_files;
-        if (statTags && st.tags_count !== undefined) statTags.innerText = st.tags_count;
+        handleTelemetryUpdate({{ stats: st }});
         
         const schedRes = await fetch('/api/scheduler/status');
         const schedData = await schedRes.json();
-        isSyncEnabled = schedData.enabled;
-        syncInterval = schedData.interval_sec;
-        if (schedData.is_running) {{
-          const cd = document.getElementById('sync-countdown');
-          if (cd) cd.innerText = 'Syncing...';
-        }} else if (schedData.next_sync_in_sec !== undefined) {{
-          nextSyncSeconds = schedData.next_sync_in_sec;
-        }}
+        handleTelemetryUpdate({{ scheduler: schedData }});
 
         const tagsRes = await fetch('/api/tags');
         const tagsData = await tagsRes.json();
@@ -1663,8 +1905,9 @@ async def index():
       }} catch (e) {{}}
     }}
 
-    // Real-time live polling for HUD telemetry stats and sync countdown
-    setInterval(refreshStats, 4000);
+    // Real-time SSE listener + fallback polling
+    connectTelemetryStream();
+    setInterval(refreshStats, 10000);
 
     /* RAG Chat Drawer Logic */
     function toggleChatDrawer() {{
