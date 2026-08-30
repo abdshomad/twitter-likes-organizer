@@ -8,12 +8,14 @@ from fastapi.staticfiles import StaticFiles
 from src.server.config import HOST, PORT, DATA_DIR, MEDIA_DIR
 from src.storage.lancedb_client import LanceDBStore
 from src.storage.history_manager import HistoryManager
+from src.media.media_queue import MediaQueue
 from src.ai.tagger import AITagger
 from src.ai.embedder import VectorEmbedder
-from src.media.downloader import MediaDownloader
 from src.exporter.markdown_exporter import export_tweets_to_directory
 from src.ingestion.archive_parser import parse_like_js_content
 from src.ingestion.playwright_scraper import PlaywrightXScraper
+from src.ingestion.graphql_client import TwitterGraphQLClient
+from src.ingestion.unliker import TwitterUnliker
 from src.ingestion.sync_pipeline import stream_likes_sync
 from src.ingestion.background_sync import BackgroundSyncScheduler
 
@@ -22,16 +24,19 @@ store = LanceDBStore()
 history = HistoryManager()
 tagger = AITagger()
 embedder = VectorEmbedder()
-downloader = MediaDownloader()
+media_queue = MediaQueue(store=store)
 scraper = PlaywrightXScraper()
-scheduler = BackgroundSyncScheduler(scraper, store, tagger, embedder, downloader, interval_sec=600)
+unliker = TwitterUnliker(scraper.session_path)
+scheduler = BackgroundSyncScheduler(scraper, store, tagger, embedder, media_queue, interval_sec=600)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(scheduler.start_loop())
+    sched_task = asyncio.create_task(scheduler.start_loop())
+    queue_task = asyncio.create_task(media_queue.worker_loop())
     yield
-    task.cancel()
+    sched_task.cancel()
+    queue_task.cancel()
 
 
 app = FastAPI(title="X-Likes Organizer", version="0.1.0", lifespan=lifespan)
@@ -45,7 +50,9 @@ async def health_check():
 
 @app.get("/api/stats")
 async def get_stats():
-    return store.get_stats()
+    base = store.get_stats()
+    base["media_queue"] = media_queue.get_status()
+    return base
 
 
 @app.get("/api/tags")
@@ -69,10 +76,22 @@ async def scheduler_toggle():
     return {"enabled": state, "status": scheduler.get_status()}
 
 
-@app.post("/api/scheduler/run-now")
-async def scheduler_run_now(bg: BackgroundTasks):
-    bg.add_task(scheduler.run_sync_cycle)
-    return {"status": "triggered"}
+@app.post("/api/settings/auto-unlike/toggle")
+async def toggle_auto_unlike():
+    state = scheduler.toggle_auto_unlike()
+    return {"auto_unlike": state, "status": scheduler.get_status()}
+
+
+@app.get("/api/media-queue/status")
+async def get_media_queue_status():
+    return media_queue.get_status()
+
+
+@app.post("/api/maintenance/unlike-synced")
+async def maintenance_unlike_synced(bg: BackgroundTasks):
+    tweets = store.get_all_tweets(limit=10000)
+    bg.add_task(unliker.bulk_unlike, tweets)
+    return {"status": "started", "target_count": len(tweets), "message": f"Started unliking {len(tweets)} tweets on X."}
 
 
 @app.get("/api/history/logs")
@@ -113,16 +132,12 @@ async def auth_disconnect():
     return {"status": "success", "connected": False}
 
 
-@app.post("/api/auth/launch-browser")
-async def auth_launch_browser(bg: BackgroundTasks):
-    bg.add_task(scraper.authenticate_interactive)
-    return {"status": "launched", "message": "Headed login browser launched on system display."}
-
-
 @app.get("/api/sync/stream")
 async def sync_stream(max_tweets: int = 0, username: str = ""):
+    sched_status = scheduler.get_status()
+    auto_unlike = sched_status.get("auto_unlike", False)
     return StreamingResponse(
-        stream_likes_sync(scraper, store, tagger, embedder, downloader, username, max_tweets),
+        stream_likes_sync(scraper, store, tagger, embedder, media_queue, username, max_tweets, auto_unlike),
         media_type="text/event-stream",
     )
 
@@ -163,6 +178,7 @@ async def export_markdown():
 @app.get("/", response_class=HTMLResponse)
 async def index():
     stats = store.get_stats()
+    q_stat = media_queue.get_status()
     tags = store.get_all_tags()[:15]
     tags_html = "".join([f"<span class='tag' onclick='filterTag(\"{t['tag']}\")'>{t['tag']} ({t['count']})</span>" for t in tags])
     auth = scraper.get_session_status()
@@ -229,6 +245,7 @@ async def index():
           <span>{f'Connected @{auth["username"]}' if auth['connected'] and auth['username'] else ('Connected' if auth['connected'] else 'Not Connected')}</span>
           <button class="secondary" onclick="openAuthModal()" style="padding:0.25rem 0.5rem; font-size:0.75rem;">{ 'Manage' if auth['connected'] else 'Connect' }</button>
         </div>
+        <button id="btn-auto-unlike" class="secondary" onclick="toggleAutoUnlike()">{'Auto-Unlike: ON' if sched.get('auto_unlike') else 'Auto-Unlike: OFF'}</button>
         <button id="btn-auto-sync" class="secondary" onclick="toggleAutoSync()">{'Auto-Sync: ON' if sched['enabled'] else 'Auto-Sync: OFF'}</button>
         <button id="btn-sync" onclick="startSyncStream()">Sync Now</button>
         <button class="secondary" onclick="openHistoryModal()">
@@ -249,14 +266,17 @@ async def index():
         <div id="progress-fill" class="progress-bar-fill"></div>
       </div>
       <div id="feed-terminal" class="feed-terminal">
-        <div>[Ready] Ultra-fast GraphQL pipeline with automatic Playwright fallback.</div>
+        <div>[Ready] Ultra-fast Decoupled 2-Stage Ingestion Pipeline with Auto-Unlike on X.</div>
       </div>
     </div>
 
     <div class="grid">
       <div class="card"><h4>Total Likes</h4><p id="stat-total">{stats['total_likes']}</p></div>
       <div class="card"><h4>Vectors</h4><p id="stat-vectors">{stats['indexed_vectors']}</p></div>
-      <div class="card"><h4>Media Files</h4><p id="stat-media">{stats['archived_media_files']}</p></div>
+      <div class="card">
+        <h4>Media Files</h4>
+        <p id="stat-media">{stats['archived_media_files']} <span style="font-size:0.75rem; color:var(--muted); font-weight:normal;">({q_stat['pending_count']} queued)</span></p>
+      </div>
       <div class="card"><h4>Tags</h4><p id="stat-tags">{stats['tags_count']}</p></div>
     </div>
     <div class="search-bar">
@@ -291,11 +311,11 @@ async def index():
 
   <div class="modal" id="auth-modal">
     <div class="modal-content">
-      <h3 style="margin-bottom:1rem;">Connect Twitter Account</h3>
+      <h3 style="margin-bottom:1rem;">Twitter Account & Maintenance</h3>
       <div class="tabs">
         <div class="tab active" id="tab-btn-login" onclick="switchTab('login')">Account Login</div>
         <div class="tab" id="tab-btn-cookies" onclick="switchTab('cookies')">Paste Cookies</div>
-        <div class="tab" id="tab-btn-browser" onclick="switchTab('browser')">Headed Browser</div>
+        <div class="tab" id="tab-btn-clean" onclick="switchTab('clean')">Clean X Likes</div>
       </div>
       <div id="tab-login">
         <p style="color:var(--muted); margin-bottom:1rem; font-size:0.9rem;">Sign in directly with your Twitter credentials.</p>
@@ -311,9 +331,9 @@ async def index():
         <input type="text" id="auth-ct0" placeholder="ct0 (optional)" style="width:100%; margin-bottom:1rem;">
         <button onclick="saveCookiesAuth()" style="width:100%;">Save & Connect</button>
       </div>
-      <div id="tab-browser" style="display:none;">
-        <p style="color:var(--muted); margin-bottom:1.5rem; font-size:0.9rem;">Launches a headed browser on system display for manual login or solving captcha.</p>
-        <button onclick="launchBrowserLogin()" style="width:100%;">Launch Login Browser</button>
+      <div id="tab-clean" style="display:none;">
+        <p style="color:var(--muted); margin-bottom:1rem; font-size:0.9rem;">Unlikes all indexed tweets on X to clean up your public timeline. Your local LanceDB database will NOT be touched.</p>
+        <button onclick="startBulkUnlike()" style="background:#ef4444; width:100%;">Clean & Unlike All on X</button>
       </div>
       <div style="display:flex; justify-content:space-between; margin-top:1.5rem;">
         <button class="secondary" onclick="disconnectTwitter()">Disconnect</button>
@@ -348,7 +368,7 @@ async def index():
     function closeHistoryModal() {{ document.getElementById('history-modal').style.display = 'none'; }}
     
     function switchTab(t) {{
-      ['login', 'cookies', 'browser'].forEach(tab => {{
+      ['login', 'cookies', 'clean'].forEach(tab => {{
         document.getElementById('tab-' + tab).style.display = tab === t ? 'block' : 'none';
         document.getElementById('tab-btn-' + tab).className = 'tab ' + (tab === t ? 'active' : '');
       }});
@@ -419,6 +439,21 @@ async def index():
       const data = await res.json();
       document.getElementById('btn-auto-sync').innerText = data.enabled ? 'Auto-Sync: ON' : 'Auto-Sync: OFF';
     }}
+
+    async function toggleAutoUnlike() {{
+      const res = await fetch('/api/settings/auto-unlike/toggle', {{ method: 'POST' }});
+      const data = await res.json();
+      document.getElementById('btn-auto-unlike').innerText = data.auto_unlike ? 'Auto-Unlike: ON' : 'Auto-Unlike: OFF';
+    }}
+
+    async function startBulkUnlike() {{
+      if (!confirm('Clean and unlike all synced likes on Twitter/X? Local database will remain safe.')) return;
+      const res = await fetch('/api/maintenance/unlike-synced', {{ method: 'POST' }});
+      const data = await res.json();
+      alert(data.message);
+      closeAuthModal();
+    }}
+
     async function submitDirectLogin() {{
       const username = document.getElementById('login-username').value;
       const password = document.getElementById('login-password').value;
@@ -437,12 +472,6 @@ async def index():
       }} finally {{
         btn.innerText = 'Sign In to Twitter'; btn.disabled = false;
       }}
-    }}
-    async function launchBrowserLogin() {{
-      const res = await fetch('/api/auth/launch-browser', {{ method: 'POST' }});
-      const data = await res.json();
-      alert(data.message);
-      closeAuthModal();
     }}
     async function saveCookiesAuth() {{
       const auth_token = document.getElementById('auth-token').value;
@@ -489,7 +518,8 @@ async def index():
           feed.scrollTop = feed.scrollHeight;
         }} else if (data.stage === 'item_done') {{
           statusTitle.innerText = `Ingesting (#${{data.current}})...`;
-          feed.innerHTML += `<div>[Ingested] <strong style="color:var(--primary)">@${{data.author_handle || 'user'}}</strong>: "${{data.text}}" <span style="color:#10b981;">[${{data.tags.join(', ')}}]</span></div>`;
+          const unlikeTag = data.unliked ? ' <span style="color:#ef4444;">[Unliked on X]</span>' : '';
+          feed.innerHTML += `<div>[Stage 1 Ingested] <strong style="color:var(--primary)">@${{data.author_handle || 'user'}}</strong>: "${{data.text}}" <span style="color:#10b981;">[${{data.tags.join(', ')}}]</span>${{unlikeTag}}</div>`;
           feed.scrollTop = feed.scrollHeight;
         }} else if (data.stage === 'complete') {{
           progressFill.style.width = '100%';

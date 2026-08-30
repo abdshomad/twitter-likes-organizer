@@ -6,11 +6,12 @@ from pathlib import Path
 from typing import Any
 from src.storage.lancedb_client import LanceDBStore
 from src.storage.history_manager import HistoryManager
+from src.media.media_queue import MediaQueue
 from src.ai.tagger import AITagger
 from src.ai.embedder import VectorEmbedder
-from src.media.downloader import MediaDownloader
 from src.ingestion.playwright_scraper import PlaywrightXScraper
 from src.ingestion.graphql_client import TwitterGraphQLClient
+from src.ingestion.unliker import TwitterUnliker
 
 SYNC_STATE_PATH = Path(os.getenv("DATA_DIR", "data")) / "sync_state.json"
 
@@ -22,18 +23,20 @@ class BackgroundSyncScheduler:
         store: LanceDBStore,
         tagger: AITagger,
         embedder: VectorEmbedder,
-        downloader: MediaDownloader,
+        media_queue: MediaQueue,
         interval_sec: int = 600,
     ):
         self.scraper = scraper
         self.gql_client = TwitterGraphQLClient(scraper.session_path)
+        self.unliker = TwitterUnliker(scraper.session_path)
         self.store = store
+        self.media_queue = media_queue
         self.history = HistoryManager()
         self.tagger = tagger
         self.embedder = embedder
-        self.downloader = downloader
         self.interval_sec = interval_sec
         self.enabled = True
+        self.auto_unlike = False
         self.is_running = False
         self.last_sync_time: float = 0
         self.total_synced_count: int = 0
@@ -45,6 +48,7 @@ class BackgroundSyncScheduler:
             try:
                 data = json.loads(SYNC_STATE_PATH.read_text())
                 self.enabled = data.get("enabled", True)
+                self.auto_unlike = data.get("auto_unlike", False)
                 self.last_sync_time = data.get("last_sync_time", 0)
                 self.total_synced_count = data.get("total_synced_count", 0)
             except Exception:
@@ -54,6 +58,7 @@ class BackgroundSyncScheduler:
         SYNC_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "enabled": self.enabled,
+            "auto_unlike": self.auto_unlike,
             "last_sync_time": self.last_sync_time,
             "total_synced_count": self.total_synced_count,
             "interval_sec": self.interval_sec,
@@ -66,6 +71,7 @@ class BackgroundSyncScheduler:
         next_in = max(0, int(self.interval_sec - elapsed)) if self.enabled else 0
         return {
             "enabled": self.enabled,
+            "auto_unlike": self.auto_unlike,
             "is_running": self.is_running,
             "interval_sec": self.interval_sec,
             "next_sync_in_sec": next_in,
@@ -77,6 +83,11 @@ class BackgroundSyncScheduler:
         self.enabled = not self.enabled if enable is None else enable
         self._save_state()
         return self.enabled
+
+    def toggle_auto_unlike(self, enable: bool | None = None) -> bool:
+        self.auto_unlike = not self.auto_unlike if enable is None else enable
+        self._save_state()
+        return self.auto_unlike
 
     async def run_sync_cycle(self) -> int:
         if self.is_running:
@@ -98,7 +109,10 @@ class BackgroundSyncScheduler:
                 nonlocal inserted_count
                 if tweet.get("id") in existing_ids:
                     return
-                tweet["local_media_paths"] = self.downloader.download_tweet_media(tweet)
+                media_urls = tweet.get("media_urls", [])
+                if media_urls:
+                    await self.media_queue.enqueue(tweet.get("id", ""), media_urls)
+
                 tweet["tags"] = self.tagger.generate_tags(tweet["text"])
                 try:
                     tweet["vector"] = self.embedder.embed_text(tweet["text"])
@@ -108,6 +122,12 @@ class BackgroundSyncScheduler:
                 self.store.upsert_tweets([tweet])
                 existing_ids.add(tweet.get("id"))
                 inserted_count += 1
+
+                if self.auto_unlike:
+                    try:
+                        await self.unliker.unlike_tweet(tweet.get("id", ""), tweet.get("url", ""))
+                    except Exception:
+                        pass
 
             uname = status.get("username", "")
             try:
@@ -128,7 +148,7 @@ class BackgroundSyncScheduler:
                 status="success",
                 new_likes=inserted_count,
                 total_db_likes=total_db,
-                message=f"Auto-sync completed (+{inserted_count} likes).",
+                message=f"Auto-sync completed (+{inserted_count} likes, media enqueued).",
                 duration_sec=duration,
             )
         except Exception as e:

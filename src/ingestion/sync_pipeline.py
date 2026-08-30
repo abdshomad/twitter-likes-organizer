@@ -4,11 +4,12 @@ import time
 from typing import AsyncGenerator
 from src.storage.lancedb_client import LanceDBStore
 from src.storage.history_manager import HistoryManager
+from src.media.media_queue import MediaQueue
 from src.ai.tagger import AITagger
 from src.ai.embedder import VectorEmbedder
-from src.media.downloader import MediaDownloader
 from src.ingestion.playwright_scraper import PlaywrightXScraper
 from src.ingestion.graphql_client import TwitterGraphQLClient
+from src.ingestion.unliker import TwitterUnliker
 
 
 async def stream_likes_sync(
@@ -16,18 +17,20 @@ async def stream_likes_sync(
     store: LanceDBStore,
     tagger: AITagger,
     embedder: VectorEmbedder,
-    downloader: MediaDownloader,
+    media_queue: MediaQueue,
     username: str = "",
     max_tweets: int = 0,
+    auto_unlike: bool = False,
 ) -> AsyncGenerator[str, None]:
     start_time = time.time()
     history = HistoryManager()
+    unliker = TwitterUnliker(scraper.session_path)
     status = scraper.get_session_status()
     if not status.get("connected"):
         yield f"data: {json.dumps({'error': 'Please connect Twitter account first.', 'stage': 'error'})}\n\n"
         return
 
-    yield f"data: {json.dumps({'stage': 'scraping', 'percent': 5, 'message': 'Connecting via ultra-fast GraphQL interceptor...'})}\n\n"
+    yield f"data: {json.dumps({'stage': 'scraping', 'percent': 5, 'message': 'Connecting to timeline...'})}\n\n"
     
     event_queue = asyncio.Queue()
     processed_count = 0
@@ -39,18 +42,30 @@ async def stream_likes_sync(
 
     async def on_item_found(tweet: dict):
         nonlocal processed_count
-        media_paths = downloader.download_tweet_media(tweet)
-        tweet["local_media_paths"] = media_paths
+        # 1. Enqueue media to async queue (Decoupled Stage 1)
+        media_urls = tweet.get("media_urls", [])
+        if media_urls:
+            await media_queue.enqueue(tweet.get("id", ""), media_urls)
+
+        # 2. AI tagging & vector embedding
         tags = tagger.generate_tags(tweet["text"])
         tweet["tags"] = tags
-
         try:
             tweet["vector"] = embedder.embed_text(tweet["text"])
         except Exception:
             tweet["vector"] = [0.0] * 1024
 
+        # 3. Store locally in LanceDB
         store.upsert_tweets([tweet])
         processed_count += 1
+
+        # 4. Optional Safe Auto-Unlike on X
+        unliked = False
+        if auto_unlike:
+            try:
+                unliked = await unliker.unlike_tweet(tweet.get("id", ""), tweet.get("url", ""))
+            except Exception:
+                pass
 
         await event_queue.put({
             "stage": "item_done",
@@ -60,7 +75,8 @@ async def stream_likes_sync(
             "author_name": tweet.get("author_name"),
             "text": tweet.get("text", "")[:120],
             "tags": tags,
-            "media_count": len(media_paths),
+            "media_count": len(media_urls),
+            "unliked": unliked,
         })
 
     async def run_sync():
@@ -77,7 +93,7 @@ async def stream_likes_sync(
                 "scroll_attempt": 1,
                 "tweets_found": processed_count,
                 "height": 0,
-                "page_url": f"GraphQL fallback to Playwright: {str(gql_err)[:60]}...",
+                "page_url": f"GraphQL fallback to Playwright: {str(gql_err)[:50]}...",
             })
             return await scraper.scrape_likes(
                 username=username, max_tweets=max_tweets, on_progress=on_progress, on_item_found=on_item_found
@@ -107,7 +123,7 @@ async def stream_likes_sync(
             status="success",
             new_likes=processed_count,
             total_db_likes=total_db,
-            message=f"Synced {processed_count} likes successfully.",
+            message=f"Synced {processed_count} likes (Decoupled Stage 1).",
             duration_sec=duration,
         )
     except Exception as e:
