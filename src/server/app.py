@@ -7,6 +7,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from src.server.config import HOST, PORT, DATA_DIR, MEDIA_DIR
 from src.storage.lancedb_client import LanceDBStore
+from src.storage.history_manager import HistoryManager
 from src.ai.tagger import AITagger
 from src.ai.embedder import VectorEmbedder
 from src.media.downloader import MediaDownloader
@@ -18,6 +19,7 @@ from src.ingestion.background_sync import BackgroundSyncScheduler
 
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 store = LanceDBStore()
+history = HistoryManager()
 tagger = AITagger()
 embedder = VectorEmbedder()
 downloader = MediaDownloader()
@@ -71,6 +73,22 @@ async def scheduler_toggle():
 async def scheduler_run_now(bg: BackgroundTasks):
     bg.add_task(scheduler.run_sync_cycle)
     return {"status": "triggered"}
+
+
+@app.get("/api/history/logs")
+async def get_history_logs(limit: int = 50):
+    return {"logs": history.get_sync_logs(limit=limit)}
+
+
+@app.get("/api/history/notifications")
+async def get_notifications(limit: int = 50):
+    return history.get_notifications(limit=limit)
+
+
+@app.post("/api/history/notifications/read-all")
+async def mark_notifications_read():
+    count = history.mark_all_read()
+    return {"status": "success", "marked_read": count}
 
 
 @app.post("/api/auth/login")
@@ -129,6 +147,8 @@ async def ingest_archive(file: UploadFile = File(...)):
         if not t.get("tags"):
             t["tags"] = tagger.generate_tags(t["text"])
     inserted = store.upsert_tweets(tweets)
+    total_db = store.get_stats().get("total_likes", 0)
+    history.add_sync_log("archive-upload", "parser", "success", len(tweets), total_db, "Imported like.js archive.")
     return {"status": "success", "parsed": len(tweets), "inserted": inserted}
 
 
@@ -136,6 +156,7 @@ async def ingest_archive(file: UploadFile = File(...)):
 async def export_markdown():
     export_dir = DATA_DIR / "exports"
     files = export_tweets_to_directory(store.get_all_tweets(limit=5000), export_dir)
+    history.add_notification("info", "Markdown Export Completed", f"Exported {len(files)} files to {export_dir}.")
     return {"status": "success", "exported_count": len(files), "export_dir": str(export_dir)}
 
 
@@ -146,6 +167,8 @@ async def index():
     tags_html = "".join([f"<span class='tag' onclick='filterTag(\"{t['tag']}\")'>{t['tag']} ({t['count']})</span>" for t in tags])
     auth = scraper.get_session_status()
     sched = scheduler.get_status()
+    notifs = history.get_notifications(limit=10)
+    unread = notifs["unread_count"]
     
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -154,7 +177,7 @@ async def index():
   <title>𝕏 Likes Organizer</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
-    :root {{ --bg: #090a0f; --card: #12151f; --border: #232936; --primary: #1d9bf0; --text: #e2e8f0; --muted: #94a3b8; --success: #10b981; }}
+    :root {{ --bg: #090a0f; --card: #12151f; --border: #232936; --primary: #1d9bf0; --text: #e2e8f0; --muted: #94a3b8; --success: #10b981; --warn: #f59e0b; }}
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); padding: 2rem; }}
     .container {{ max-width: 1000px; margin: 0 auto; }}
@@ -182,10 +205,18 @@ async def index():
     .progress-bar-fill {{ background: linear-gradient(90deg, #1d9bf0, #10b981); height: 100%; width: 0%; transition: width 0.3s ease; }}
     .feed-terminal {{ background: #06070a; border: 1px solid #1a202c; border-radius: 6px; padding: 0.75rem; max-height: 160px; overflow-y: auto; font-family: monospace; font-size: 0.8rem; color: #a0aec0; }}
     .modal {{ display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); align-items: center; justify-content: center; z-index: 100; }}
-    .modal-content {{ background: var(--card); border: 1px solid var(--border); padding: 2rem; border-radius: 12px; max-width: 500px; width: 90%; }}
+    .modal-content {{ background: var(--card); border: 1px solid var(--border); padding: 2rem; border-radius: 12px; max-width: 650px; width: 90%; max-height: 85vh; overflow-y: auto; }}
     .tabs {{ display: flex; gap: 1rem; border-bottom: 1px solid var(--border); margin-bottom: 1.5rem; }}
     .tab {{ padding: 0.5rem 1rem; cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent; }}
     .tab.active {{ color: var(--primary); border-bottom-color: var(--primary); font-weight: 600; }}
+    .badge {{ background: #ef4444; color: white; border-radius: 999px; padding: 0.15rem 0.45rem; font-size: 0.75rem; font-weight: bold; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
+    th, td {{ padding: 0.6rem; text-align: left; border-bottom: 1px solid var(--border); }}
+    th {{ color: var(--muted); }}
+    .status-tag {{ padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.75rem; }}
+    .status-tag.success {{ background: rgba(16,185,129,0.2); color: var(--success); }}
+    .status-tag.error {{ background: rgba(239,68,68,0.2); color: #ef4444; }}
+    .notif-card {{ background: #090a0f; border: 1px solid var(--border); padding: 0.85rem; border-radius: 6px; margin-bottom: 0.75rem; }}
   </style>
 </head>
 <body>
@@ -200,6 +231,9 @@ async def index():
         </div>
         <button id="btn-auto-sync" class="secondary" onclick="toggleAutoSync()">{'Auto-Sync: ON' if sched['enabled'] else 'Auto-Sync: OFF'}</button>
         <button id="btn-sync" onclick="startSyncStream()">Sync Now</button>
+        <button class="secondary" onclick="openHistoryModal()">
+          Logs & Alerts {f'<span class="badge" id="unread-badge">{unread}</span>' if unread > 0 else '<span id="unread-badge"></span>'}
+        </button>
         <button class="secondary" onclick="document.getElementById('file-upload').click()">Import like.js</button>
         <input type="file" id="file-upload" style="display:none" onchange="uploadArchive(this)">
         <button class="secondary" onclick="exportMarkdown()">Export</button>
@@ -215,7 +249,7 @@ async def index():
         <div id="progress-fill" class="progress-bar-fill"></div>
       </div>
       <div id="feed-terminal" class="feed-terminal">
-        <div>[Ready] Running progressive sync without re-visiting indexed likes.</div>
+        <div>[Ready] Ultra-fast GraphQL pipeline with automatic Playwright fallback.</div>
       </div>
     </div>
 
@@ -231,6 +265,28 @@ async def index():
     </div>
     <div class="tag-cloud">{tags_html}</div>
     <div id="results"></div>
+  </div>
+
+  <div class="modal" id="history-modal">
+    <div class="modal-content">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
+        <h3>Activity & Notification History</h3>
+        <button class="secondary" onclick="closeHistoryModal()">Close</button>
+      </div>
+      <div class="tabs">
+        <div class="tab active" id="tab-btn-logs" onclick="switchHistTab('logs')">Sync Logs</div>
+        <div class="tab" id="tab-btn-notifs" onclick="switchHistTab('notifs')">Notifications</div>
+      </div>
+      <div id="tab-logs">
+        <div id="logs-container" style="overflow-x:auto;">Loading logs...</div>
+      </div>
+      <div id="tab-notifs" style="display:none;">
+        <div style="display:flex; justify-content:flex-end; margin-bottom:0.75rem;">
+          <button class="secondary" onclick="markAllNotifsRead()" style="padding:0.25rem 0.6rem; font-size:0.75rem;">Mark All Read</button>
+        </div>
+        <div id="notifs-container">Loading notifications...</div>
+      </div>
+    </div>
   </div>
 
   <div class="modal" id="auth-modal">
@@ -288,12 +344,76 @@ async def index():
     function filterTag(tag) {{ document.getElementById('query').value = ''; search(tag); }}
     function openAuthModal() {{ document.getElementById('auth-modal').style.display = 'flex'; }}
     function closeAuthModal() {{ document.getElementById('auth-modal').style.display = 'none'; }}
+    function openHistoryModal() {{ document.getElementById('history-modal').style.display = 'flex'; loadHistoryLogs(); loadNotifications(); }}
+    function closeHistoryModal() {{ document.getElementById('history-modal').style.display = 'none'; }}
+    
     function switchTab(t) {{
       ['login', 'cookies', 'browser'].forEach(tab => {{
         document.getElementById('tab-' + tab).style.display = tab === t ? 'block' : 'none';
         document.getElementById('tab-btn-' + tab).className = 'tab ' + (tab === t ? 'active' : '');
       }});
     }}
+    function switchHistTab(t) {{
+      document.getElementById('tab-logs').style.display = t === 'logs' ? 'block' : 'none';
+      document.getElementById('tab-notifs').style.display = t === 'notifs' ? 'block' : 'none';
+      document.getElementById('tab-btn-logs').className = 'tab ' + (t === 'logs' ? 'active' : '');
+      document.getElementById('tab-btn-notifs').className = 'tab ' + (t === 'notifs' ? 'active' : '');
+    }}
+
+    async function loadHistoryLogs() {{
+      const res = await fetch('/api/history/logs?limit=30');
+      const data = await res.json();
+      const container = document.getElementById('logs-container');
+      if (!data.logs || data.logs.length === 0) {{
+        container.innerHTML = '<p style="color:var(--muted); text-align:center; padding:1rem;">No sync logs recorded yet.</p>';
+        return;
+      }}
+      container.innerHTML = `
+        <table>
+          <thead>
+            <tr><th>Time</th><th>Trigger</th><th>Engine</th><th>Added</th><th>Total</th><th>Status</th><th>Duration</th></tr>
+          </thead>
+          <tbody>
+            ${{data.logs.map(l => `
+              <tr>
+                <td>${{l.timestamp.split(' ')[1]}}</td>
+                <td><strong>${{l.trigger}}</strong></td>
+                <td>${{l.engine}}</td>
+                <td>+${{l.new_likes}}</td>
+                <td>${{l.total_db_likes}}</td>
+                <td><span class="status-tag ${{l.status}}">${{l.status}}</span></td>
+                <td>${{l.duration_sec}}s</td>
+              </tr>
+            `).join('')}}
+          </tbody>
+        </table>
+      `;
+    }}
+
+    async function loadNotifications() {{
+      const res = await fetch('/api/history/notifications?limit=30');
+      const data = await res.json();
+      const container = document.getElementById('notifs-container');
+      if (!data.notifications || data.notifications.length === 0) {{
+        container.innerHTML = '<p style="color:var(--muted); text-align:center; padding:1rem;">No notifications.</p>';
+        return;
+      }}
+      container.innerHTML = data.notifications.map(n => `
+        <div class="notif-card" style="border-left: 3px solid ${{n.type === 'error' ? '#ef4444' : (n.type === 'success' ? '#10b981' : '#1d9bf0')}}">
+          <div style="display:flex; justify-content:space-between; font-size:0.8rem; color:var(--muted); margin-bottom:0.25rem;">
+            <strong>${{n.title}}</strong><span>${{n.timestamp}}</span>
+          </div>
+          <p style="font-size:0.85rem;">${{n.message}}</p>
+        </div>
+      `).join('');
+    }}
+
+    async function markAllNotifsRead() {{
+      await fetch('/api/history/notifications/read-all', {{ method: 'POST' }});
+      document.getElementById('unread-badge').innerText = '';
+      loadNotifications();
+    }}
+
     async function toggleAutoSync() {{
       const res = await fetch('/api/scheduler/toggle', {{ method: 'POST' }});
       const data = await res.json();
@@ -368,11 +488,7 @@ async def index():
           feed.innerHTML += `<div>[Scroll #${{data.scroll_attempt}}] ${{data.page_url}} | Found: <strong style="color:#10b981;">${{data.tweets_found}}</strong> likes (Height: ${{data.height}}px)</div>`;
           feed.scrollTop = feed.scrollHeight;
         }} else if (data.stage === 'item_done') {{
-          if (data.percent !== undefined) {{
-            progressFill.style.width = data.percent + '%';
-            percentText.innerText = data.percent + '%';
-          }}
-          statusTitle.innerText = `Ingesting (${{data.current}}/${{data.total}})...`;
+          statusTitle.innerText = `Ingesting (#${{data.current}})...`;
           feed.innerHTML += `<div>[Ingested] <strong style="color:var(--primary)">@${{data.author_handle || 'user'}}</strong>: "${{data.text}}" <span style="color:#10b981;">[${{data.tags.join(', ')}}]</span></div>`;
           feed.scrollTop = feed.scrollHeight;
         }} else if (data.stage === 'complete') {{

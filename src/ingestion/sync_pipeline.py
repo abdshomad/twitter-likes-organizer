@@ -1,7 +1,9 @@
 import asyncio
 import json
+import time
 from typing import AsyncGenerator
 from src.storage.lancedb_client import LanceDBStore
+from src.storage.history_manager import HistoryManager
 from src.ai.tagger import AITagger
 from src.ai.embedder import VectorEmbedder
 from src.media.downloader import MediaDownloader
@@ -18,6 +20,8 @@ async def stream_likes_sync(
     username: str = "",
     max_tweets: int = 0,
 ) -> AsyncGenerator[str, None]:
+    start_time = time.time()
+    history = HistoryManager()
     status = scraper.get_session_status()
     if not status.get("connected"):
         yield f"data: {json.dumps({'error': 'Please connect Twitter account first.', 'stage': 'error'})}\n\n"
@@ -27,6 +31,7 @@ async def stream_likes_sync(
     
     event_queue = asyncio.Queue()
     processed_count = 0
+    engine_used = "graphql"
     gql_client = TwitterGraphQLClient(scraper.session_path)
 
     async def on_progress(data: dict):
@@ -59,16 +64,14 @@ async def stream_likes_sync(
         })
 
     async def run_sync():
+        nonlocal engine_used
         try:
-            # 1. Primary: Direct GraphQL Interceptor (100x faster)
             uname = username or status.get("username", "")
             return await gql_client.fetch_all_likes_streaming(
-                username=uname,
-                max_tweets=max_tweets,
-                on_progress=on_progress,
-                on_item_found=on_item_found,
+                username=uname, max_tweets=max_tweets, on_progress=on_progress, on_item_found=on_item_found
             )
         except Exception as gql_err:
+            engine_used = "playwright"
             await event_queue.put({
                 "stage": "scrolling",
                 "scroll_attempt": 1,
@@ -76,12 +79,8 @@ async def stream_likes_sync(
                 "height": 0,
                 "page_url": f"GraphQL fallback to Playwright: {str(gql_err)[:60]}...",
             })
-            # 2. Fallback: Headless Playwright
             return await scraper.scrape_likes(
-                username=username,
-                max_tweets=max_tweets,
-                on_progress=on_progress,
-                on_item_found=on_item_found,
+                username=username, max_tweets=max_tweets, on_progress=on_progress, on_item_found=on_item_found
             )
         finally:
             await event_queue.put({"stage": "scrape_finished"})
@@ -97,9 +96,30 @@ async def stream_likes_sync(
         except asyncio.TimeoutError:
             continue
 
+    duration = time.time() - start_time
+    total_db = store.get_stats().get("total_likes", 0)
+
     try:
         await sync_task
+        history.add_sync_log(
+            trigger="manual-ui",
+            engine=engine_used,
+            status="success",
+            new_likes=processed_count,
+            total_db_likes=total_db,
+            message=f"Synced {processed_count} likes successfully.",
+            duration_sec=duration,
+        )
     except Exception as e:
+        history.add_sync_log(
+            trigger="manual-ui",
+            engine=engine_used,
+            status="error",
+            new_likes=processed_count,
+            total_db_likes=total_db,
+            message=str(e),
+            duration_sec=duration,
+        )
         yield f"data: {json.dumps({'error': f'Sync failed: {str(e)}', 'stage': 'error'})}\n\n"
         return
 

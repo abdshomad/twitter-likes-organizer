@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 from typing import Any
 from src.storage.lancedb_client import LanceDBStore
+from src.storage.history_manager import HistoryManager
 from src.ai.tagger import AITagger
 from src.ai.embedder import VectorEmbedder
 from src.media.downloader import MediaDownloader
@@ -27,6 +28,7 @@ class BackgroundSyncScheduler:
         self.scraper = scraper
         self.gql_client = TwitterGraphQLClient(scraper.session_path)
         self.store = store
+        self.history = HistoryManager()
         self.tagger = tagger
         self.embedder = embedder
         self.downloader = downloader
@@ -85,6 +87,9 @@ class BackgroundSyncScheduler:
 
         self.is_running = True
         inserted_count = 0
+        start_time = time.time()
+        engine_used = "graphql"
+
         try:
             existing_tweets = self.store.get_all_tweets(limit=100000)
             existing_ids = {t["tweet_id"] for t in existing_tweets if t.get("tweet_id")}
@@ -108,13 +113,36 @@ class BackgroundSyncScheduler:
             try:
                 await self.gql_client.fetch_all_likes_streaming(username=uname, max_tweets=0, on_item_found=on_item_found)
             except Exception:
+                engine_used = "playwright"
                 await self.scraper.scrape_likes(username=uname, max_tweets=0, on_item_found=on_item_found)
 
             self.last_sync_time = time.time()
             self.total_synced_count += inserted_count
             self._save_state()
-        except Exception:
-            pass
+
+            duration = time.time() - start_time
+            total_db = self.store.get_stats().get("total_likes", 0)
+            self.history.add_sync_log(
+                trigger="auto-cron",
+                engine=engine_used,
+                status="success",
+                new_likes=inserted_count,
+                total_db_likes=total_db,
+                message=f"Auto-sync completed (+{inserted_count} likes).",
+                duration_sec=duration,
+            )
+        except Exception as e:
+            duration = time.time() - start_time
+            total_db = self.store.get_stats().get("total_likes", 0)
+            self.history.add_sync_log(
+                trigger="auto-cron",
+                engine=engine_used,
+                status="error",
+                new_likes=inserted_count,
+                total_db_likes=total_db,
+                message=str(e),
+                duration_sec=duration,
+            )
         finally:
             self.is_running = False
         return inserted_count

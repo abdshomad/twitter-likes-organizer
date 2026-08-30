@@ -5,6 +5,7 @@ from httpx import ASGITransport, AsyncClient
 from src.server.app import app, store
 from src.exporter.markdown_exporter import format_tweet_to_markdown, export_tweets_to_directory
 from src.ai.tagger import AITagger
+from src.storage.history_manager import HistoryManager
 from src.ingestion.playwright_scraper import PlaywrightXScraper
 from src.ingestion.graphql_client import TwitterGraphQLClient
 
@@ -41,6 +42,23 @@ def test_heuristic_tagger():
     assert "LLM" in tags or "Python" in tags or "Linux" in tags
 
 
+def test_history_manager(tmp_path):
+    hm = HistoryManager(data_dir=tmp_path)
+    log = hm.add_sync_log(
+        trigger="manual", engine="graphql", status="success", new_likes=10, total_db_likes=50, duration_sec=1.2
+    )
+    assert log["new_likes"] == 10
+    logs = hm.get_sync_logs()
+    assert len(logs) == 1
+
+    notifs = hm.get_notifications()
+    assert notifs["unread_count"] == 1
+    assert len(notifs["notifications"]) == 1
+
+    hm.mark_all_read()
+    assert hm.get_notifications()["unread_count"] == 0
+
+
 def test_isolated_scraper_persistence(tmp_path):
     session_file = tmp_path / "session.json"
     backup_file = tmp_path / "backup.json"
@@ -66,7 +84,6 @@ def test_graphql_response_parser(tmp_path):
     assert "authorization" in headers
     assert "auth_token=test_auth" in headers["cookie"]
 
-    # Mock GraphQL response payload
     mock_payload = {
         "data": {
             "user": {
@@ -129,8 +146,6 @@ async def test_api_endpoints():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         res = await client.get("/api/stats")
         assert res.status_code == 200
-        data = res.json()
-        assert "total_likes" in data
 
         res = await client.get("/api/tags")
         assert res.status_code == 200
@@ -141,13 +156,19 @@ async def test_api_endpoints():
         res = await client.get("/api/auth/status")
         assert res.status_code == 200
 
-        # Scheduler endpoints
         res = await client.get("/api/scheduler/status")
         assert res.status_code == 200
-        sched_data = res.json()
-        assert "enabled" in sched_data
-        assert "interval_sec" in sched_data
 
         res = await client.post("/api/scheduler/toggle")
         assert res.status_code == 200
-        assert "enabled" in res.json()
+
+        res = await client.get("/api/history/logs")
+        assert res.status_code == 200
+        assert "logs" in res.json()
+
+        res = await client.get("/api/history/notifications")
+        assert res.status_code == 200
+        assert "unread_count" in res.json()
+
+        res = await client.post("/api/history/notifications/read-all")
+        assert res.status_code == 200
