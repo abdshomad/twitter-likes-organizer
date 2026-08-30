@@ -1,5 +1,6 @@
 import asyncio
 import json
+import shutil
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -254,6 +255,40 @@ async def get_similar_tweets(tweet_id: str, limit: int = Query(4, ge=1, le=20)):
     return {"tweet_id": tweet_id, "count": len(filtered), "similar": filtered}
 
 
+def cleanup_local_media(tweet_ids: list[str]):
+    for tid in tweet_ids:
+        tid_str = str(tid).strip()
+        if not tid_str:
+            continue
+        p = MEDIA_DIR / tid_str
+        if p.exists() and p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+        for loose in MEDIA_DIR.glob(f"{tid_str}_*"):
+            try:
+                loose.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+@app.delete("/api/tweets/{tweet_id}")
+async def delete_single_tweet(tweet_id: str):
+    deleted = store.delete_tweets([tweet_id])
+    cleanup_local_media([tweet_id])
+    history.add_notification("info", "Deleted Tweet", f"Removed tweet #{tweet_id} and local media.")
+    return {"status": "success", "tweet_id": tweet_id, "deleted": deleted}
+
+
+@app.post("/api/tweets/bulk-delete")
+async def bulk_delete_tweets(payload: dict[str, Any] = Body(...)):
+    tweet_ids = payload.get("tweet_ids", [])
+    if not tweet_ids or not isinstance(tweet_ids, list):
+        return JSONResponse(status_code=400, content={"status": "error", "message": "tweet_ids list required"})
+    deleted = store.delete_tweets(tweet_ids)
+    cleanup_local_media(tweet_ids)
+    history.add_notification("info", "Bulk Deleted Likes", f"Removed {deleted} tweets and associated media.")
+    return {"status": "success", "deleted_count": deleted}
+
+
 @app.post("/api/ingest/archive")
 async def ingest_archive(file: UploadFile = File(...)):
     content = await file.read()
@@ -486,6 +521,11 @@ async def index():
     .toast-log {{ font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: var(--muted); max-height: 90px; overflow-y: auto; margin-top: 0.5rem; }}
     .hud-btn {{ background: rgba(255, 255, 255, 0.06); color: var(--text); border: 1px solid var(--card-border); padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; font-size: 0.8rem; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; transition: all 0.2s ease; min-height: 38px; }}
     .hud-btn:hover {{ background: rgba(255, 255, 255, 0.12); border-color: rgba(255, 255, 255, 0.25); }}
+    .hud-bulk-bar {{ position: fixed; bottom: 2rem; left: 50%; transform: translateX(-50%); background: rgba(15, 23, 42, 0.94); backdrop-filter: blur(16px); border: 1px solid var(--primary); border-radius: 9999px; padding: 0.6rem 1.25rem; display: flex; align-items: center; justify-content: space-between; gap: 1.25rem; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.7), 0 0 20px rgba(56, 189, 248, 0.25); z-index: 1000; max-width: 92vw; }}
+    .tweet-checkbox {{ position: absolute; top: 12px; left: 12px; width: 18px; height: 18px; accent-color: var(--primary); cursor: pointer; z-index: 5; display: none; }}
+    .is-selecting .tweet-checkbox {{ display: block !important; }}
+    .is-selecting .hud-tweet-card, .is-selecting .gallery-card, .is-selecting .compact-row {{ position: relative; }}
+    .is-selecting .hud-tweet-card.selected, .is-selecting .gallery-card.selected, .is-selecting .compact-row.selected {{ border-color: var(--primary); background: rgba(56, 189, 248, 0.08); }}
     .mobile-drag-handle {{ width: 40px; height: 5px; background: rgba(255, 255, 255, 0.25); border-radius: 3px; margin: 8px auto 4px; display: none; }}
 
     /* Responsive Mobile Overrides */
@@ -637,6 +677,11 @@ async def index():
               <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5" fill="currentColor"/><path d="M21 15l-5-5L5 21"/></svg> Gallery
             </button>
           </div>
+
+          <!-- Select / Bulk Action Mode Toggle -->
+          <button class="icon-btn" id="btn-toggle-select" onclick="toggleSelectMode()" title="Toggle Multi-Select Mode">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg> Select
+          </button>
         </div>
       </div>
     </div>
@@ -681,6 +726,7 @@ async def index():
           <a id="modal-open-x-btn" href="#" target="_blank" class="hud-btn" style="text-decoration:none;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg> Open on 𝕏</a>
           <button id="modal-filter-author-btn" class="hud-btn"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg> Filter by Author</button>
           <button id="modal-unlike-btn" class="hud-btn" style="background:rgba(239,68,68,0.15); border-color:#ef4444; color:#f87171;" onclick="unlikeActiveModalTweet()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/><path d="m12 5-1 4 2 3-2 4"/></svg> Unlike on 𝕏</button>
+          <button id="modal-delete-btn" class="hud-btn" style="background:rgba(239,68,68,0.15); border-color:#ef4444; color:#f87171;" onclick="confirmDeleteCurrentModalTweet()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg> Delete Saved Like</button>
         </div>
       </div>
     </div>
@@ -894,6 +940,33 @@ async def index():
     </div>
   </div>
 
+  <!-- Floating Bulk Action Toolbar -->
+  <div id="hud-bulk-bar" class="hud-bulk-bar" style="display:none;">
+    <div style="display:flex; align-items:center; gap:10px;">
+      <span id="bulk-selected-count" style="font-weight:700; color:#38bdf8; font-size:0.88rem;">0 selected</span>
+      <button class="hud-btn" style="padding:4px 10px; font-size:0.75rem;" onclick="selectAllVisibleTweets()">Select All</button>
+      <button class="hud-btn" style="padding:4px 10px; font-size:0.75rem;" onclick="clearTweetSelection()">Clear</button>
+    </div>
+    <div style="display:flex; align-items:center; gap:8px;">
+      <button class="hud-btn" style="background:#ef4444; border-color:#dc2626; color:#ffffff; padding:5px 12px; font-size:0.8rem; font-weight:600;" onclick="confirmBulkDelete()">
+        🗑️ Delete Selected
+      </button>
+      <button class="hud-icon-btn" onclick="toggleSelectMode()" style="width:26px; height:26px;">✕</button>
+    </div>
+  </div>
+
+  <!-- Generic Glassmorphic Confirmation Modal -->
+  <div id="hud-confirm-modal" class="hud-modal-backdrop" style="z-index:9999;" onclick="if(event.target===this) closeConfirmModal()">
+    <div class="hud-modal-box" style="max-width:420px; padding:1.25rem;">
+      <h3 id="confirm-modal-title" style="font-size:1.05rem; font-weight:700; color:#f87171; margin-bottom:0.5rem;">Confirm Delete</h3>
+      <p id="confirm-modal-message" style="color:var(--text); font-size:0.85rem; line-height:1.4; margin-bottom:1.25rem;"></p>
+      <div style="display:flex; justify-content:flex-end; gap:8px;">
+        <button class="hud-btn" onclick="closeConfirmModal()">Cancel</button>
+        <button id="confirm-modal-action-btn" class="hud-btn" style="background:#ef4444; border-color:#dc2626; color:#ffffff; font-weight:600;">Confirm Delete</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     let currentQuery = '';
     let currentTag = null;
@@ -913,6 +986,9 @@ async def index():
     const loadedTweetsMap = new Map();
     let activeModalTweet = null;
     const PAGE_LIMIT = 24;
+    let isSelectMode = false;
+    const selectedTweetIds = new Set();
+    let confirmCallback = null;
 
     /* Top Tags & Expand/Collapse */
     let currentRawTags = {tags_json};
@@ -1128,9 +1204,13 @@ async def index():
         const authorDisplay = cleanHandle ? '@' + cleanHandle : 'Post #' + r.tweet_id;
         const formattedText = formatTweetText(r.text);
 
+        const isSelected = selectedTweetIds.has(r.tweet_id);
+        const checkboxHtml = `<input type="checkbox" class="tweet-checkbox" onchange="onTweetCheckboxChange(event, '${{r.tweet_id}}')" onclick="event.stopPropagation()" ${{isSelected ? 'checked' : ''}}>`;
+
         if (displayMode === 'list') {{
           return `
-            <div class="compact-row" onclick="openTweetModal('${{r.tweet_id}}')">
+            <div class="compact-row ${{isSelected ? 'selected' : ''}}" onclick="onCardClick(event, '${{r.tweet_id}}')">
+              ${{checkboxHtml}}
               <span class="author-interactive" onclick="event.stopPropagation(); filterAuthor('${{cleanHandle}}')">${{authorDisplay}}</span>
               <span class="compact-text">${{r.text}}</span>
               <div style="display:flex; gap:0.35rem; align-items:center;">
@@ -1144,7 +1224,8 @@ async def index():
         if (displayMode === 'gallery') {{
           const mediaSrc = mediaList.length ? mediaList[0] : '';
           return `
-            <div class="gallery-card" onclick="openTweetModal('${{r.tweet_id}}')">
+            <div class="gallery-card ${{isSelected ? 'selected' : ''}}" onclick="onCardClick(event, '${{r.tweet_id}}')">
+              ${{checkboxHtml}}
               ${{mediaSrc ? (isVideoMedia(mediaSrc) ? `<video class="gallery-img" src="${{mediaSrc}}" preload="metadata" muted playsinline></video>` : `<img class="gallery-img" src="${{mediaSrc}}" onerror="this.src='${{fallbackSrc}}'" loading="lazy">`) : '<div style=\"height:120px; background:#131926; display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:0.8rem;\">Text Post</div>'}}
               <div class="gallery-body">
                 <div class="tweet-header">
@@ -1161,7 +1242,8 @@ async def index():
           `;
         }}
         return `
-          <div class="hud-tweet-card" onclick="openTweetModal('${{r.tweet_id}}')">
+          <div class="hud-tweet-card ${{isSelected ? 'selected' : ''}}" onclick="onCardClick(event, '${{r.tweet_id}}')">
+            ${{checkboxHtml}}
             <div>
               <div class="tweet-header">
                 <div style="display:flex; align-items:center; gap:4px;">
@@ -1223,6 +1305,149 @@ async def index():
       document.getElementById('query').value = '';
       currentQuery = '';
       loadLikes(false);
+    }}
+
+    /* Multi-Select & Selection Handlers */
+    function onCardClick(e, tweetId) {{
+      if (isSelectMode) {{
+        if (selectedTweetIds.has(tweetId)) {{
+          selectedTweetIds.delete(tweetId);
+        }} else {{
+          selectedTweetIds.add(tweetId);
+        }}
+        updateSelectionUI();
+      }} else {{
+        openTweetModal(tweetId);
+      }}
+    }}
+
+    function toggleSelectMode() {{
+      isSelectMode = !isSelectMode;
+      const btn = document.getElementById('btn-toggle-select');
+      const results = document.getElementById('results');
+      if (btn) btn.classList.toggle('active', isSelectMode);
+      if (results) results.classList.toggle('is-selecting', isSelectMode);
+      if (!isSelectMode) {{
+        selectedTweetIds.clear();
+      }}
+      updateSelectionUI();
+    }}
+
+    function onTweetCheckboxChange(e, tweetId) {{
+      if (e.target.checked) {{
+        selectedTweetIds.add(tweetId);
+      }} else {{
+        selectedTweetIds.delete(tweetId);
+      }}
+      updateSelectionUI();
+    }}
+
+    function updateSelectionUI() {{
+      const bulkBar = document.getElementById('hud-bulk-bar');
+      const countEl = document.getElementById('bulk-selected-count');
+      if (countEl) countEl.innerText = `${{selectedTweetIds.size}} selected`;
+      if (bulkBar) {{
+        bulkBar.style.display = isSelectMode ? 'flex' : 'none';
+      }}
+      document.querySelectorAll('.hud-tweet-card, .gallery-card, .compact-row').forEach(el => {{
+        const cb = el.querySelector('.tweet-checkbox');
+        if (cb) {{
+          const tid = cb.getAttribute('onchange')?.match(/'([^']+)'/)?.[1];
+          const isSel = tid && selectedTweetIds.has(tid);
+          cb.checked = !!isSel;
+          el.classList.toggle('selected', !!isSel);
+        }}
+      }});
+    }}
+
+    function selectAllVisibleTweets() {{
+      loadedTweetsMap.forEach((_, tid) => selectedTweetIds.add(tid));
+      updateSelectionUI();
+    }}
+
+    function clearTweetSelection() {{
+      selectedTweetIds.clear();
+      updateSelectionUI();
+    }}
+
+    /* Confirmation Modal Logic */
+    function showConfirmDialog(opts) {{
+      const title = opts.title || 'Confirm Delete';
+      const message = opts.message || 'Are you sure you want to proceed?';
+      const confirmText = opts.confirmText || 'Delete';
+      document.getElementById('confirm-modal-title').innerText = title;
+      document.getElementById('confirm-modal-message').innerText = message;
+      const actionBtn = document.getElementById('confirm-modal-action-btn');
+      actionBtn.innerText = confirmText;
+      confirmCallback = opts.onConfirm;
+      document.getElementById('hud-confirm-modal').classList.add('open');
+    }}
+
+    function closeConfirmModal() {{
+      document.getElementById('hud-confirm-modal').classList.remove('open');
+      confirmCallback = null;
+    }}
+
+    document.addEventListener('DOMContentLoaded', () => {{
+      const confirmActionBtn = document.getElementById('confirm-modal-action-btn');
+      if (confirmActionBtn) {{
+        confirmActionBtn.onclick = function() {{
+          if (confirmCallback) confirmCallback();
+          closeConfirmModal();
+        }};
+      }}
+    }});
+
+    function confirmDeleteCurrentModalTweet() {{
+      if (!activeModalTweet) return;
+      const tid = activeModalTweet.tweet_id;
+      const name = activeModalTweet.author_name || activeModalTweet.author_handle || 'this tweet';
+      showConfirmDialog({{
+        title: 'Delete Saved Like?',
+        message: `Are you sure you want to permanently delete the saved like from ${{name}} (#${{tid}}) and its downloaded media?`,
+        confirmText: 'Delete Like',
+        onConfirm: async () => {{
+          try {{
+            const res = await fetch(`/api/tweets/${{tid}}`, {{ method: 'DELETE' }});
+            if (res.ok) {{
+              closeTweetModal();
+              searchCache.clear();
+              refreshStats();
+              loadLikes(false);
+            }}
+          }} catch (err) {{
+            alert('Failed to delete tweet: ' + err);
+          }}
+        }}
+      }});
+    }}
+
+    function confirmBulkDelete() {{
+      if (selectedTweetIds.size === 0) return;
+      const count = selectedTweetIds.size;
+      showConfirmDialog({{
+        title: `Delete ${{count}} Saved Likes?`,
+        message: `Are you sure you want to permanently delete ${{count}} selected likes and their downloaded media from storage?`,
+        confirmText: `Delete ${{count}} Likes`,
+        onConfirm: async () => {{
+          try {{
+            const res = await fetch('/api/tweets/bulk-delete', {{
+              method: 'POST',
+              headers: {{ 'Content-Type': 'application/json' }},
+              body: JSON.stringify({{ tweet_ids: Array.from(selectedTweetIds) }})
+            }});
+            if (res.ok) {{
+              selectedTweetIds.clear();
+              toggleSelectMode();
+              searchCache.clear();
+              refreshStats();
+              loadLikes(false);
+            }}
+          }} catch (err) {{
+            alert('Failed to bulk delete: ' + err);
+          }}
+        }}
+      }});
     }}
 
     /* Lightbox Modal Logic */

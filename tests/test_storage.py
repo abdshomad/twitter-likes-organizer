@@ -80,3 +80,10 @@ def test_lancedb_crud(temp_lancedb):
     assert most_liked[0]["tweet_id"] == "1002"
     assert most_liked[0]["favorite_count"] == 950
     assert most_liked[1]["favorite_count"] == 42
+
+    # Test Deletion
+    deleted = temp_lancedb.delete_tweets(["1001"])
+    assert deleted == 1
+    after_del = temp_lancedb.get_all_tweets()
+    assert len(after_del) == 1
+    assert after_del[0]["tweet_id"] == "1002"

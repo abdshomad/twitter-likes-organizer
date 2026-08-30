@@ -83,6 +83,32 @@ class LanceDBStore:
         self._invalidate_cache()
         return len(cleaned)
 
+    def delete_tweets(self, tweet_ids: list[str]) -> int:
+        if not tweet_ids:
+            return 0
+        clean_ids = [str(tid).replace("'", "''") for tid in tweet_ids if tid]
+        if not clean_ids:
+            return 0
+        if len(clean_ids) == 1:
+            where_expr = f"tweet_id = '{clean_ids[0]}'"
+        else:
+            in_clause = ", ".join(f"'{cid}'" for cid in clean_ids)
+            where_expr = f"tweet_id IN ({in_clause})"
+        try:
+            self.table.delete(where_expr)
+            self._invalidate_cache()
+            return len(clean_ids)
+        except Exception:
+            deleted = 0
+            for cid in clean_ids:
+                try:
+                    self.table.delete(f"tweet_id = '{cid}'")
+                    deleted += 1
+                except Exception:
+                    pass
+            self._invalidate_cache()
+            return deleted
+
     def get_all_tweets(self, limit: int = 1000) -> list[dict[str, Any]]:
         return self.table.search().limit(limit).to_list()
 
