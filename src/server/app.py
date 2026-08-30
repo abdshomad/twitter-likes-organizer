@@ -200,6 +200,8 @@ async def index():
         </div>
         <button id="btn-auto-sync" class="secondary" onclick="toggleAutoSync()">{'Auto-Sync: ON' if sched['enabled'] else 'Auto-Sync: OFF'}</button>
         <button id="btn-sync" onclick="startSyncStream()">Sync Now</button>
+        <button class="secondary" onclick="document.getElementById('file-upload').click()">Import like.js</button>
+        <input type="file" id="file-upload" style="display:none" onchange="uploadArchive(this)">
         <button class="secondary" onclick="exportMarkdown()">Export</button>
       </div>
     </header>
@@ -348,8 +350,7 @@ async def index():
       
       drawer.style.display = 'block';
       feed.innerHTML = '';
-      btn.disabled = true;
-      btn.innerText = 'Syncing...';
+      btn.disabled = true; btn.innerText = 'Syncing...';
 
       const es = new EventSource('/api/sync/stream?max_tweets=50');
       es.onmessage = function(e) {{
@@ -386,6 +387,16 @@ async def index():
         es.close();
         btn.disabled = false; btn.innerText = 'Sync Now';
       }};
+    }}
+    async function uploadArchive(input) {{
+      if (!input.files || !input.files[0]) return;
+      const file = input.files[0];
+      const formData = new FormData();
+      formData.append('file', file);
+      const res = await fetch('/api/ingest/archive', {{ method: 'POST', body: formData }});
+      const data = await res.json();
+      if (res.ok) {{ alert(`Imported ${{data.parsed}} likes from archive!`); location.reload(); }}
+      else {{ alert('Import failed.'); }}
     }}
     async function exportMarkdown() {{
       const res = await fetch('/api/export/markdown', {{ method: 'POST' }});
