@@ -197,7 +197,7 @@ async def index():
     :root {{ --bg: #090a0f; --card: #12151f; --border: #232936; --primary: #1d9bf0; --text: #e2e8f0; --muted: #94a3b8; --success: #10b981; --warn: #f59e0b; }}
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); padding: 2rem; }}
-    .container {{ max-width: 1000px; margin: 0 auto; }}
+    .container {{ max-width: 1200px; margin: 0 auto; }}
     header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 1rem; margin-bottom: 1.5rem; }}
     .auth-banner {{ display: flex; align-items: center; gap: 0.75rem; background: var(--card); border: 1px solid var(--border); padding: 0.5rem 0.9rem; border-radius: 8px; font-size: 0.85rem; }}
     .dot {{ width: 8px; height: 8px; border-radius: 50%; display: inline-block; }}
@@ -212,14 +212,25 @@ async def index():
     button {{ background: var(--primary); color: white; border: none; padding: 0.55rem 1.1rem; border-radius: 6px; cursor: pointer; font-weight: 500; font-size: 0.85rem; }}
     button.secondary {{ background: #27272a; color: var(--text); }}
     button:hover {{ opacity: 0.9; }}
+    .controls-row {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }}
+    .view-switcher {{ display: flex; gap: 0.35rem; background: var(--card); border: 1px solid var(--border); padding: 0.3rem; border-radius: 8px; }}
+    .view-btn {{ background: transparent; color: var(--muted); border: none; padding: 0.35rem 0.75rem; border-radius: 5px; cursor: pointer; font-size: 0.8rem; }}
+    .view-btn.active {{ background: rgba(29,155,240,0.2); color: var(--primary); font-weight: 600; }}
     .tag-cloud {{ display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1.5rem; }}
     .tag {{ background: rgba(29,155,240,0.15); color: var(--primary); padding: 0.25rem 0.6rem; border-radius: 999px; font-size: 0.8rem; cursor: pointer; transition: all 0.2s ease; }}
     .tag:hover {{ background: rgba(29,155,240,0.3); }}
     .tag.active {{ background: var(--primary); color: #fff; font-weight: bold; }}
-    #results {{ display: flex; flex-direction: column; gap: 1rem; }}
+    #results.view-1col {{ display: flex; flex-direction: column; gap: 1rem; max-width: 800px; margin: 0 auto; }}
+    #results.view-2col {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 1rem; }}
+    #results.view-3col {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }}
+    #results.view-compact {{ display: flex; flex-direction: column; gap: 0.4rem; }}
+    @media (max-width: 900px) {{ #results.view-3col {{ grid-template-columns: repeat(2, 1fr); }} }}
+    @media (max-width: 650px) {{ #results.view-2col, #results.view-3col {{ grid-template-columns: 1fr; }} }}
     .tweet-card {{ background: var(--card); border: 1px solid var(--border); padding: 1.25rem; border-radius: 8px; transition: transform 0.15s ease; }}
     .tweet-card:hover {{ border-color: rgba(29,155,240,0.4); }}
     .tweet-header {{ display: flex; justify-content: space-between; color: var(--muted); font-size: 0.85rem; margin-bottom: 0.5rem; }}
+    .compact-row {{ display: flex; justify-content: space-between; align-items: center; background: var(--card); border: 1px solid var(--border); padding: 0.75rem 1rem; border-radius: 6px; gap: 1rem; font-size: 0.85rem; }}
+    .compact-text {{ flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
     .sync-drawer {{ display: none; background: #0e111a; border: 1px solid var(--border); border-radius: 8px; padding: 1.25rem; margin-bottom: 1.5rem; }}
     .progress-bar-bg {{ background: #1e2330; border-radius: 6px; height: 10px; overflow: hidden; margin: 0.75rem 0; }}
     .progress-bar-fill {{ background: linear-gradient(90deg, #1d9bf0, #10b981); height: 100%; width: 0%; transition: width 0.3s ease; }}
@@ -239,7 +250,7 @@ async def index():
     .notif-card {{ background: #090a0f; border: 1px solid var(--border); padding: 0.85rem; border-radius: 6px; margin-bottom: 0.75rem; }}
     .skeleton {{ background: linear-gradient(90deg, #151926 25%, #1e2436 50%, #151926 75%); background-size: 200% 100%; animation: shimmer 1.5s infinite; border-radius: 4px; }}
     @keyframes shimmer {{ 0% {{ background-position: 200% 0; }} 100% {{ background-position: -200% 0; }} }}
-    .skeleton-card {{ background: var(--card); border: 1px solid var(--border); padding: 1.25rem; border-radius: 8px; margin-bottom: 1rem; }}
+    .skeleton-card {{ background: var(--card); border: 1px solid var(--border); padding: 1.25rem; border-radius: 8px; }}
     .media-grid {{ display: flex; gap: 0.5rem; margin-top: 0.75rem; overflow-x: auto; }}
     .media-thumb {{ max-height: 180px; border-radius: 6px; object-fit: cover; border: 1px solid var(--border); }}
   </style>
@@ -275,7 +286,7 @@ async def index():
         <div id="progress-fill" class="progress-bar-fill"></div>
       </div>
       <div id="feed-terminal" class="feed-terminal">
-        <div>[Ready] Decoupled 2-stage pipeline with instant lazy-loaded tag browsing.</div>
+        <div>[Ready] Decoupled 2-stage pipeline with instant lazy-loaded multi-column browsing.</div>
       </div>
     </div>
 
@@ -288,13 +299,24 @@ async def index():
       </div>
       <div class="card"><h4>Tags</h4><p id="stat-tags">{stats['tags_count']}</p></div>
     </div>
+
     <div class="search-bar">
       <input id="query" type="text" placeholder="Search likes (FTS + Vector Semantic)..." onkeyup="if(event.key==='Enter') triggerNewSearch()">
       <button onclick="triggerNewSearch()">Search</button>
       <button class="secondary" onclick="clearFilters()" id="btn-clear-filter" style="display:none;">Clear Filter</button>
     </div>
-    <div class="tag-cloud">{tags_html}</div>
-    <div id="results"></div>
+
+    <div class="controls-row">
+      <div class="tag-cloud" style="margin-bottom:0;">{tags_html}</div>
+      <div class="view-switcher">
+        <button class="view-btn" id="btn-view-1col" onclick="setViewMode('1col')">1 Col</button>
+        <button class="view-btn active" id="btn-view-2col" onclick="setViewMode('2col')">2 Col</button>
+        <button class="view-btn" id="btn-view-3col" onclick="setViewMode('3col')">3 Col</button>
+        <button class="view-btn" id="btn-view-compact" onclick="setViewMode('compact')">List</button>
+      </div>
+    </div>
+
+    <div id="results" class="view-2col"></div>
     <div id="scroll-sentinel" style="height:20px; margin-top:1rem;"></div>
   </div>
 
@@ -359,7 +381,19 @@ async def index():
     let currentOffset = 0;
     let isLoading = false;
     let hasMore = true;
-    const PAGE_LIMIT = 15;
+    let viewMode = localStorage.getItem('likes_view_mode') || '2col';
+    const PAGE_LIMIT = 18;
+
+    function setViewMode(mode) {{
+      viewMode = mode;
+      localStorage.setItem('likes_view_mode', mode);
+      document.querySelectorAll('.view-btn').forEach(b => b.classList.remove('active'));
+      const activeBtn = document.getElementById('btn-view-' + mode);
+      if (activeBtn) activeBtn.classList.add('active');
+      const results = document.getElementById('results');
+      results.className = 'view-' + mode;
+      loadLikes(false);
+    }}
 
     function renderSkeleton() {{
       const container = document.getElementById('results');
@@ -367,6 +401,7 @@ async def index():
         <div class="skeleton-card"><div class="skeleton" style="height:16px; width:30%; margin-bottom:10px;"></div><div class="skeleton" style="height:14px; width:90%; margin-bottom:8px;"></div><div class="skeleton" style="height:14px; width:70%;"></div></div>
         <div class="skeleton-card"><div class="skeleton" style="height:16px; width:25%; margin-bottom:10px;"></div><div class="skeleton" style="height:14px; width:95%; margin-bottom:8px;"></div><div class="skeleton" style="height:14px; width:60%;"></div></div>
         <div class="skeleton-card"><div class="skeleton" style="height:16px; width:35%; margin-bottom:10px;"></div><div class="skeleton" style="height:14px; width:80%; margin-bottom:8px;"></div></div>
+        <div class="skeleton-card"><div class="skeleton" style="height:16px; width:28%; margin-bottom:10px;"></div><div class="skeleton" style="height:14px; width:88%; margin-bottom:8px;"></div></div>
       `;
     }}
 
@@ -390,18 +425,30 @@ async def index():
         if (results.length < PAGE_LIMIT) hasMore = false;
 
         if (results.length === 0 && !append) {{
-          container.innerHTML = '<div class="card" style="text-align:center; color: var(--muted);">No matching likes found.</div>';
+          container.innerHTML = '<div class="card" style="text-align:center; color: var(--muted); grid-column: 1 / -1;">No matching likes found.</div>';
           return;
         }}
 
-        const html = results.map(r => `
-          <div class="tweet-card">
-            <div class="tweet-header"><span><strong>${{r.author_name || 'User'}}</strong> <span style="color:var(--muted)">@${{r.author_handle || 'user'}}</span></span><a href="${{r.url}}" target="_blank" style="color:var(--primary)">View on X</a></div>
-            <p style="white-space:pre-wrap; line-height:1.4;">${{r.text}}</p>
-            ${{r.media_urls && r.media_urls.length ? `<div class="media-grid">${{r.media_urls.map(m => `<img class="media-thumb" src="${{m}}" loading="lazy">`).join('')}}</div>` : ''}}
-            <div style="margin-top:0.75rem">${{(r.tags || []).map(t => `<span class="tag" onclick="filterTag('${{t}}')">${{t}}</span>`).join(' ')}}</div>
-          </div>
-        `).join('');
+        const html = results.map(r => {{
+          if (viewMode === 'compact') {{
+            return `
+              <div class="compact-row">
+                <span style="font-weight:600; color:var(--primary); min-width:120px;">@${{r.author_handle || 'user'}}</span>
+                <span class="compact-text">${{r.text}}</span>
+                <div style="display:flex; gap:0.25rem;">${{(r.tags || []).slice(0, 2).map(t => `<span class="tag" style="font-size:0.7rem; padding:0.1rem 0.4rem;" onclick="filterTag('${{t}}')">${{t}}</span>`).join('')}}</div>
+                <a href="${{r.url}}" target="_blank" style="color:var(--muted); font-size:0.75rem;">Link</a>
+              </div>
+            `;
+          }}
+          return `
+            <div class="tweet-card">
+              <div class="tweet-header"><span><strong>${{r.author_name || 'User'}}</strong> <span style="color:var(--muted)">@${{r.author_handle || 'user'}}</span></span><a href="${{r.url}}" target="_blank" style="color:var(--primary)">View on X</a></div>
+              <p style="white-space:pre-wrap; line-height:1.4;">${{r.text}}</p>
+              ${{r.media_urls && r.media_urls.length ? `<div class="media-grid">${{r.media_urls.map(m => `<img class="media-thumb" src="${{m}}" loading="lazy">`).join('')}}</div>` : ''}}
+              <div style="margin-top:0.75rem">${{(r.tags || []).map(t => `<span class="tag" onclick="filterTag('${{t}}')">${{t}}</span>`).join(' ')}}</div>
+            </div>
+          `;
+        }}).join('');
 
         container.insertAdjacentHTML('beforeend', html);
         currentOffset += results.length;
@@ -435,7 +482,6 @@ async def index():
       loadLikes(false);
     }}
 
-    // Lazy load on scroll near bottom
     const observer = new IntersectionObserver((entries) => {{
       if (entries[0].isIntersecting && hasMore && !isLoading) {{
         loadLikes(true);
@@ -443,8 +489,9 @@ async def index():
     }}, {{ rootMargin: '300px' }});
     observer.observe(document.getElementById('scroll-sentinel'));
 
-    // Initial load
-    window.addEventListener('DOMContentLoaded', () => loadLikes(false));
+    window.addEventListener('DOMContentLoaded', () => {{
+      setViewMode(viewMode);
+    }});
 
     function openAuthModal() {{ document.getElementById('auth-modal').style.display = 'flex'; }}
     function closeAuthModal() {{ document.getElementById('auth-modal').style.display = 'none'; }}
