@@ -166,19 +166,9 @@ class BackgroundSyncScheduler:
                 engine_used = "playwright"
                 await self.scraper.scrape_likes(username=uname, max_tweets=0, on_item_found=on_item_found)
 
-            # Rolling 1-Like Buffer: Spare the #1 latest like on X, unlike older likes
+            # Unlike all discovered likes from top to bottom on X
             if self.auto_unlike and discovered_batch:
-                # If we had a previous spared tweet and a newer one was found, unlike the previous one now
-                new_spared_id = str(discovered_batch[0].get("id") or discovered_batch[0].get("tweet_id"))
-                if self.last_spared_tweet_id and self.last_spared_tweet_id != new_spared_id:
-                    try:
-                        await self.unliker.ensure_unliked(self.last_spared_tweet_id, max_attempts=3)
-                        unliked_count += 1
-                    except Exception:
-                        pass
-
-                # Unlike items starting from index 1 (sparing index 0 as rolling anchor)
-                for t in discovered_batch[1:]:
+                for t in discovered_batch:
                     if (time.time() - start_time) >= max_duration_sec:
                         break
                     tid = str(t.get("id") or t.get("tweet_id"))
@@ -186,11 +176,9 @@ class BackgroundSyncScheduler:
                         success, _ = await self.unliker.ensure_unliked(tid, max_attempts=3)
                         if success:
                             unliked_count += 1
-                        await asyncio.sleep(0.6)
+                        await asyncio.sleep(0.5)
                     except Exception:
                         pass
-
-                self.last_spared_tweet_id = new_spared_id
 
             self.last_sync_time = time.time()
             self.total_synced_count += inserted_count
