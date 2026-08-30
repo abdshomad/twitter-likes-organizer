@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import asyncio
 from pathlib import Path
 from typing import Any, Callable, Awaitable
@@ -156,6 +157,31 @@ class PlaywrightXScraper:
                             if src:
                                 media_urls.append(src)
 
+                        # Extract like count
+                        favorite_count = 0
+                        like_btn = article.locator("button[data-testid='like'], button[data-testid='unlike'], div[data-testid='like'], div[data-testid='unlike']").first
+                        if await like_btn.count() > 0:
+                            aria = await like_btn.get_attribute("aria-label") or ""
+                            txt = await like_btn.inner_text() or ""
+                            match = re.search(r"([\d,.]+[kKmM]?)\s*(?:Likes|Like)?", f"{aria} {txt}")
+                            if match:
+                                raw_c = match.group(1).replace(",", "").strip().lower()
+                                if "k" in raw_c:
+                                    try:
+                                        favorite_count = int(float(raw_c.replace("k", "")) * 1000)
+                                    except Exception:
+                                        pass
+                                elif "m" in raw_c:
+                                    try:
+                                        favorite_count = int(float(raw_c.replace("m", "")) * 1000000)
+                                    except Exception:
+                                        pass
+                                else:
+                                    try:
+                                        favorite_count = int(float(raw_c))
+                                    except Exception:
+                                        pass
+
                         seen_ids.add(tweet_id)
                         tweet_obj = {
                             "id": tweet_id,
@@ -169,7 +195,8 @@ class PlaywrightXScraper:
                             "media_urls": media_urls,
                             "local_media_paths": [],
                             "tags": [],
-                            "raw_json": json.dumps({"id": tweet_id, "text": tweet_text, "user": author_handle}),
+                            "favorite_count": favorite_count,
+                            "raw_json": json.dumps({"id": tweet_id, "text": tweet_text, "user": author_handle, "favorite_count": favorite_count}),
                         }
                         extracted_tweets.append(tweet_obj)
 

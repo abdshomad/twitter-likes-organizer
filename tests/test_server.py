@@ -46,3 +46,13 @@ async def test_similar_tweets_endpoint():
         assert "similar" in data
         assert "count" in data
         assert data["tweet_id"] == "123456"
+
+
+@pytest.mark.asyncio
+async def test_metrics_enricher_stream_endpoint():
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get("/api/maintenance/enrich-metrics/stream")
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers.get("content-type", "")

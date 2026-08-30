@@ -21,6 +21,7 @@ from src.ingestion.graphql_client import TwitterGraphQLClient
 from src.ingestion.unliker import TwitterUnliker
 from src.ingestion.sync_pipeline import stream_likes_sync
 from src.ingestion.author_hydrator import AuthorHydrator
+from src.ingestion.metrics_enricher import TweetMetricsEnricher
 from src.ingestion.background_sync import BackgroundSyncScheduler
 
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
@@ -34,6 +35,7 @@ scraper = PlaywrightXScraper()
 unliker = TwitterUnliker(scraper.session_path)
 scheduler = BackgroundSyncScheduler(scraper, store, tagger, embedder, media_queue, interval_sec=600)
 author_hydrator = AuthorHydrator(store=store)
+metrics_enricher = TweetMetricsEnricher(store=store)
 
 
 async def author_hydrator_loop(hydrator: AuthorHydrator):
@@ -271,6 +273,14 @@ async def export_markdown():
     files = export_tweets_to_directory(store.get_all_tweets(limit=5000), export_dir)
     history.add_notification("info", "Markdown Export Completed", f"Exported {len(files)} files to {export_dir}.")
     return {"status": "success", "exported_count": len(files), "export_dir": str(export_dir)}
+
+
+@app.get("/api/maintenance/enrich-metrics/stream")
+async def stream_enrich_metrics():
+    async def event_generator():
+        async for chunk in metrics_enricher.stream_enrich_all():
+            yield f"data: {chunk}\n\n"
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -847,6 +857,11 @@ async def index():
             <button class="hud-btn" onclick="exportMarkdown()" style="justify-content:center;">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
               Export All Likes to Markdown
+            </button>
+
+            <button class="hud-btn" onclick="startMetricsEnrichment()" style="justify-content:center; background:rgba(244,63,94,0.12); border-color:#f43f5e; color:#f43f5e;">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/></svg>
+              ⚡ Enrich Live Like Counts & Metrics
             </button>
 
             <button class="hud-btn" onclick="startBulkUnlike()" style="background:rgba(239,68,68,0.15); border-color:#ef4444; color:#f87171; justify-content:center;">
@@ -1522,6 +1537,51 @@ async def index():
       }};
       es.onerror = function() {{
         toastTitle.innerText = 'Sync Ended';
+        es.close();
+      }};
+    }}
+
+    function startMetricsEnrichment() {{
+      const toast = document.getElementById('floating-sync-toast');
+      const toastTitle = document.getElementById('toast-title');
+      const toastDetail = document.getElementById('toast-status-detail');
+      const toastFill = document.getElementById('toast-progress-fill');
+      const toastPercent = document.getElementById('toast-percent');
+      const toastLog = document.getElementById('toast-log');
+
+      toast.style.display = 'block';
+      toastTitle.innerText = 'Enriching Metrics...';
+      toastDetail.innerText = 'Fetching live like counts...';
+      toastLog.innerHTML = '<div>[Enricher] Initializing live syndication batch...</div>';
+      toastFill.style.width = '5%';
+      toastPercent.innerText = '5%';
+
+      const es = new EventSource('/api/maintenance/enrich-metrics/stream');
+      es.onmessage = function(e) {{
+        const data = JSON.parse(e.data);
+        if (data.stage === 'start') {{
+          toastDetail.innerText = data.message;
+        }} else if (data.stage === 'progress') {{
+          toastDetail.innerText = `Enriched ${{data.enriched}} / ${{data.current}} (${{data.percent}}%)`;
+          toastFill.style.width = `${{data.percent}}%`;
+          toastPercent.innerText = `${{data.percent}}%`;
+          toastLog.innerHTML += `<div>[Batch] ${{data.current}}/${{data.total}} processed...</div>`;
+          toastLog.scrollTop = toastLog.scrollHeight;
+        }} else if (data.stage === 'complete') {{
+          toastFill.style.width = '100%';
+          toastPercent.innerText = '100%';
+          toastTitle.innerText = 'Enrichment Complete!';
+          toastDetail.innerText = data.message;
+          toastLog.innerHTML += `<div style="color:#10b981; font-weight:bold;">[DONE] ${{data.message}}</div>`;
+          es.close();
+          searchCache.clear();
+          refreshStats();
+          loadLikes(false);
+          setTimeout(() => {{ toast.style.display = 'none'; }}, 4000);
+        }}
+      }};
+      es.onerror = function() {{
+        toastTitle.innerText = 'Enrichment Stopped';
         es.close();
       }};
     }}
