@@ -36,7 +36,7 @@ class BackgroundSyncScheduler:
         self.embedder = embedder
         self.interval_sec = interval_sec
         self.enabled = True
-        self.auto_unlike = False
+        self.auto_unlike = True
         self.is_running = False
         self.last_sync_time: float = 0
         self.total_synced_count: int = 0
@@ -48,11 +48,13 @@ class BackgroundSyncScheduler:
             try:
                 data = json.loads(SYNC_STATE_PATH.read_text())
                 self.enabled = data.get("enabled", True)
-                self.auto_unlike = data.get("auto_unlike", False)
+                self.auto_unlike = data.get("auto_unlike", True)
                 self.last_sync_time = data.get("last_sync_time", 0)
                 self.total_synced_count = data.get("total_synced_count", 0)
             except Exception:
                 pass
+        else:
+            self._save_state()
 
     def _save_state(self):
         SYNC_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -123,7 +125,6 @@ class BackgroundSyncScheduler:
                 existing_ids.add(tweet.get("id"))
                 inserted_count += 1
 
-                # Synchronous verified unlike before moving to next
                 if self.auto_unlike:
                     try:
                         await self.unliker.ensure_unliked(tweet.get("id", ""), tweet.get("url", ""), max_attempts=3)
