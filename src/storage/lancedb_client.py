@@ -79,34 +79,51 @@ class LanceDBStore:
         query: str = "",
         query_vector: list[float] | None = None,
         tag: str | None = None,
+        sort_by: str = "newest",
         offset: int = 0,
-        limit: int = 20,
+        limit: int = 24,
     ) -> list[dict[str, Any]]:
         if len(self.table) == 0:
             return []
 
+        where_clauses: list[str] = []
+        if tag:
+            escaped_tag = tag.replace("'", "''")
+            where_clauses.append(f"array_has(tags, '{escaped_tag}')")
+        if sort_by == "media_only":
+            where_clauses.append("length(media_urls) > 0")
+
+        where_expr = " AND ".join(where_clauses) if where_clauses else None
+
         if query_vector and len(query_vector) == 1024 and any(v != 0.0 for v in query_vector):
             q = self.table.search(query_vector)
-            if tag:
-                escaped_tag = tag.replace("'", "''")
-                q = q.where(f"array_has(tags, '{escaped_tag}')")
+            if where_expr:
+                q = q.where(where_expr)
             return q.offset(offset).limit(limit).to_list()
 
         if query:
             try:
                 q = self.table.search(query, query_type="fts")
-                if tag:
-                    escaped_tag = tag.replace("'", "''")
-                    q = q.where(f"array_has(tags, '{escaped_tag}')")
+                if where_expr:
+                    q = q.where(where_expr)
                 return q.offset(offset).limit(limit).to_list()
             except Exception:
                 pass
 
         q = self.table.search()
-        if tag:
-            escaped_tag = tag.replace("'", "''")
-            q = q.where(f"array_has(tags, '{escaped_tag}')")
-        return q.offset(offset).limit(limit).to_list()
+        if where_expr:
+            q = q.where(where_expr)
+        
+        # In-memory sorting for non-vector queries when requested
+        items = q.to_list()
+        if sort_by == "oldest":
+            items.sort(key=lambda x: x.get("created_at") or x.get("id") or "")
+        elif sort_by == "author":
+            items.sort(key=lambda x: (x.get("author_handle") or "").lower())
+        else: # newest
+            items.reverse()
+
+        return items[offset : offset + limit]
 
     def get_stats(self) -> dict[str, int]:
         total = len(self.table) if hasattr(self, "table") else 0

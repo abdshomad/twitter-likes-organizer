@@ -153,12 +153,13 @@ async def sync_stream(max_tweets: int = 0, username: str = ""):
 async def search_likes(
     q: str = Query("", description="Search query"),
     tag: str | None = Query(None, description="Tag filter"),
+    sort_by: str = Query("newest", description="Sort option"),
     semantic: bool = Query(False, description="Enable vector semantic search"),
     offset: int = Query(0, ge=0),
     limit: int = Query(24, ge=1, le=100),
 ):
     vector = embedder.embed_text(q.strip()) if semantic and q.strip() else None
-    results = store.search_hybrid(query=q.strip(), query_vector=vector, tag=tag, offset=offset, limit=limit)
+    results = store.search_hybrid(query=q.strip(), query_vector=vector, tag=tag, sort_by=sort_by, offset=offset, limit=limit)
     return {"count": len(results), "offset": offset, "limit": limit, "results": results}
 
 
@@ -211,7 +212,7 @@ async def index():
     .dot.connected {{ background: var(--success); box-shadow: 0 0 8px var(--success); }}
     .dot.disconnected {{ background: #ef4444; }}
     .sync-pill {{ display: flex; align-items: center; gap: 0.5rem; background: var(--card); border: 1px solid var(--border); padding: 0.4rem 0.75rem; border-radius: 8px; font-size: 0.85rem; }}
-    .sync-select {{ background: #1a202c; color: var(--text); border: 1px solid var(--border); padding: 0.25rem 0.5rem; border-radius: 4px; font-size: 0.8rem; }}
+    .sync-select, .sort-select {{ background: #1a202c; color: var(--text); border: 1px solid var(--border); padding: 0.35rem 0.6rem; border-radius: 6px; font-size: 0.85rem; outline: none; }}
     .grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 1.5rem; }}
     .card {{ background: var(--card); border: 1px solid var(--border); padding: 1.25rem; border-radius: 8px; }}
     .card h4 {{ color: var(--muted); font-size: 0.8rem; text-transform: uppercase; }}
@@ -246,10 +247,15 @@ async def index():
     .gallery-card {{ background: var(--card); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; display: flex; flex-direction: column; }}
     .gallery-img {{ width: 100%; height: 220px; object-fit: cover; border-bottom: 1px solid var(--border); }}
     .gallery-body {{ padding: 0.85rem; }}
-    .sync-drawer {{ display: none; background: #0e111a; border: 1px solid var(--border); border-radius: 8px; padding: 1.25rem; margin-bottom: 1.5rem; }}
-    .progress-bar-bg {{ background: #1e2330; border-radius: 6px; height: 10px; overflow: hidden; margin: 0.75rem 0; }}
-    .progress-bar-fill {{ background: linear-gradient(90deg, #1d9bf0, #10b981); height: 100%; width: 0%; transition: width 0.3s ease; }}
-    .feed-terminal {{ background: #06070a; border: 1px solid #1a202c; border-radius: 6px; padding: 0.75rem; max-height: 160px; overflow-y: auto; font-family: monospace; font-size: 0.8rem; color: #a0aec0; }}
+    
+    /* Non-blocking Floating Sync Toast */
+    .floating-toast {{ position: fixed; bottom: 1.5rem; right: 1.5rem; background: #0c0f17; border: 1px solid var(--border); box-shadow: 0 10px 25px rgba(0,0,0,0.6); border-radius: 10px; width: 340px; z-index: 90; display: none; overflow: hidden; font-size: 0.85rem; }}
+    .toast-header {{ padding: 0.65rem 0.9rem; display: flex; justify-content: space-between; align-items: center; background: #131722; border-bottom: 1px solid var(--border); }}
+    .toast-body {{ padding: 0.75rem 0.9rem; }}
+    .toast-progress {{ background: #1a202c; height: 6px; border-radius: 3px; overflow: hidden; margin-top: 0.5rem; }}
+    .toast-progress-fill {{ background: linear-gradient(90deg, var(--primary), var(--success)); height: 100%; width: 0%; transition: width 0.3s ease; }}
+    .toast-log {{ font-family: monospace; font-size: 0.75rem; color: var(--muted); max-height: 100px; overflow-y: auto; margin-top: 0.5rem; }}
+
     .modal {{ display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); align-items: center; justify-content: center; z-index: 100; }}
     .modal-content {{ background: var(--card); border: 1px solid var(--border); padding: 2rem; border-radius: 12px; max-width: 650px; width: 90%; max-height: 85vh; overflow-y: auto; }}
     .tabs {{ display: flex; gap: 1rem; border-bottom: 1px solid var(--border); margin-bottom: 1.5rem; }}
@@ -306,25 +312,12 @@ async def index():
       </div>
     </header>
 
-    <div id="sync-drawer" class="sync-drawer">
-      <div style="display:flex; justify-content:space-between; align-items:center;">
-        <strong id="sync-status-title" style="font-size:0.9rem;">Syncing Likes...</strong>
-        <span id="sync-percent-text" style="font-size:0.85rem; color:var(--primary); font-weight:bold;">0%</span>
-      </div>
-      <div class="progress-bar-bg">
-        <div id="progress-fill" class="progress-bar-fill"></div>
-      </div>
-      <div id="feed-terminal" class="feed-terminal">
-        <div>[Ready] Multi-column switcher with SVG controls & lazy loading.</div>
-      </div>
-    </div>
-
     <div class="grid">
       <div class="card"><h4>Total Likes</h4><p id="stat-total">{stats['total_likes']}</p></div>
       <div class="card"><h4>Vectors</h4><p id="stat-vectors">{stats['indexed_vectors']}</p></div>
       <div class="card">
         <h4>Media Files</h4>
-        <p id="stat-media">{stats['archived_media_files']} <span style="font-size:0.75rem; color:var(--muted); font-weight:normal;">({q_stat['pending_count']} queued)</span></p>
+        <p id="stat-media">{stats['archived_media_files']} <span id="stat-queued-count" style="font-size:0.75rem; color:var(--muted); font-weight:normal;">({q_stat['pending_count']} queued)</span></p>
       </div>
       <div class="card"><h4>Tags</h4><p id="stat-tags">{stats['tags_count']}</p></div>
     </div>
@@ -336,8 +329,16 @@ async def index():
     </div>
 
     <div class="controls-row">
-      <div class="tag-cloud">{tags_html}</div>
+      <div class="tag-cloud" id="tag-cloud-container">{tags_html}</div>
       <div class="toolbar-group">
+        <!-- Sort Selector -->
+        <select id="select-sort" class="sort-select" onchange="changeSort(this.value)">
+          <option value="newest">Newest First</option>
+          <option value="oldest">Oldest First</option>
+          <option value="media_only">Media Only</option>
+          <option value="author">Author A-Z</option>
+        </select>
+
         <!-- SVG Columns Selector (1, 2, 3, 4) -->
         <div class="btn-group" title="Column count">
           <button class="icon-btn" id="btn-cols-1" onclick="setCols('1')">
@@ -371,6 +372,26 @@ async def index():
 
     <div id="results" class="cols-2 mode-card"></div>
     <div id="scroll-sentinel" style="height:20px; margin-top:1rem;"></div>
+  </div>
+
+  <!-- Non-blocking Floating Sync Toast -->
+  <div id="floating-sync-toast" class="floating-toast">
+    <div class="toast-header">
+      <span style="font-weight:600; display:flex; align-items:center; gap:0.4rem;">
+        <span class="dot connected"></span> <span id="toast-title">Syncing in background...</span>
+      </span>
+      <button class="secondary" onclick="document.getElementById('floating-sync-toast').style.display='none'" style="padding:0.15rem 0.4rem; font-size:0.7rem;">Minimize</button>
+    </div>
+    <div class="toast-body">
+      <div style="display:flex; justify-content:space-between; font-size:0.8rem;">
+        <span id="toast-status-detail">Extracting likes...</span>
+        <span id="toast-percent" style="color:var(--primary); font-weight:bold;">0%</span>
+      </div>
+      <div class="toast-progress">
+        <div id="toast-progress-fill" class="toast-progress-fill"></div>
+      </div>
+      <div id="toast-log" class="toast-log">Connecting to pipeline...</div>
+    </div>
   </div>
 
   <div class="modal" id="history-modal">
@@ -431,6 +452,7 @@ async def index():
   <script>
     let currentQuery = '';
     let currentTag = null;
+    let currentSort = 'newest';
     let currentOffset = 0;
     let isLoading = false;
     let hasMore = true;
@@ -468,6 +490,11 @@ async def index():
       loadLikes(false);
     }}
 
+    function changeSort(val) {{
+      currentSort = val;
+      loadLikes(false);
+    }}
+
     function renderSkeleton() {{
       const container = document.getElementById('results');
       container.innerHTML = `
@@ -488,7 +515,7 @@ async def index():
         hasMore = true;
       }}
 
-      const url = `/api/search?q=${{encodeURIComponent(currentQuery)}}&semantic=true&offset=${{currentOffset}}&limit=${{PAGE_LIMIT}}` + (currentTag ? `&tag=${{encodeURIComponent(currentTag)}}` : '');
+      const url = `/api/search?q=${{encodeURIComponent(currentQuery)}}&sort_by=${{currentSort}}&semantic=true&offset=${{currentOffset}}&limit=${{PAGE_LIMIT}}` + (currentTag ? `&tag=${{encodeURIComponent(currentTag)}}` : '');
       try {{
         const res = await fetch(url);
         const data = await res.json();
@@ -610,6 +637,85 @@ async def index():
       }});
       const data = await res.json();
       nextSyncSeconds = data.scheduler.next_sync_in_sec || sec;
+    }}
+
+    async function refreshStats() {{
+      try {{
+        const res = await fetch('/api/stats');
+        const st = await res.json();
+        document.getElementById('stat-total').innerText = st.total_likes;
+        document.getElementById('stat-vectors').innerText = st.indexed_vectors;
+        document.getElementById('stat-media').innerHTML = `${{st.archived_media_files}} <span id="stat-queued-count" style="font-size:0.75rem; color:var(--muted); font-weight:normal;">(${{st.media_queue.pending_count}} queued)</span>`;
+        document.getElementById('stat-tags').innerText = st.tags_count;
+        
+        const tagsRes = await fetch('/api/tags');
+        const tagsData = await tagsRes.json();
+        const tHtml = (tagsData.tags || []).slice(0, 25).map(t => `<span class='tag ${{t.tag === currentTag ? 'active' : ''}}' id='tag-${{t.tag}}' onclick='filterTag("${{t.tag}}")'>${{t.tag}} (${{t.count}})</span>`).join('');
+        document.getElementById('tag-cloud-container').innerHTML = tHtml;
+      }} catch (e) {{}}
+    }}
+
+    function startSyncStream() {{
+      const toast = document.getElementById('floating-sync-toast');
+      const toastTitle = document.getElementById('toast-title');
+      const toastDetail = document.getElementById('toast-status-detail');
+      const toastFill = document.getElementById('toast-progress-fill');
+      const toastPercent = document.getElementById('toast-percent');
+      const toastLog = document.getElementById('toast-log');
+      const btn = document.getElementById('btn-sync');
+      
+      toast.style.display = 'block';
+      toastLog.innerHTML = '<div>[Connected] Starting sync stream...</div>';
+      toastFill.style.width = '10%';
+      toastPercent.innerText = '10%';
+      btn.innerText = 'Syncing...';
+
+      const es = new EventSource('/api/sync/stream?max_tweets=0');
+      es.onmessage = function(e) {{
+        const data = JSON.parse(e.data);
+        if (data.error) {{
+          toastTitle.innerText = 'Sync Error';
+          toastDetail.innerText = data.error;
+          toastLog.innerHTML += `<div style="color:#ef4444;">[ERROR] ${{data.error}}</div>`;
+          es.close();
+          btn.innerText = 'Sync Now';
+          if (data.error.includes('connect')) openAuthModal();
+          return;
+        }}
+        if (data.stage === 'scrolling') {{
+          toastTitle.innerText = `Found ${{data.tweets_found}} likes...`;
+          toastDetail.innerText = `Scroll attempt #${{data.scroll_attempt}}`;
+          toastLog.innerHTML += `<div>Scraped ${{data.tweets_found}} likes...</div>`;
+          toastLog.scrollTop = toastLog.scrollHeight;
+        }} else if (data.stage === 'item_done') {{
+          toastTitle.innerText = `Ingesting (#${{data.current}})...`;
+          toastDetail.innerText = `@${{data.author_handle || 'user'}}: "${{data.text.slice(0, 30)}}..."`;
+          toastFill.style.width = `${{Math.min(90, 20 + data.current * 3)}}%`;
+          toastPercent.innerText = `${{Math.min(90, 20 + data.current * 3)}}%`;
+          toastLog.innerHTML += `<div>[Saved] @${{data.author_handle}} ${{data.unliked ? '(Unliked on X)' : ''}}</div>`;
+          toastLog.scrollTop = toastLog.scrollHeight;
+        }} else if (data.stage === 'complete') {{
+          toastFill.style.width = '100%';
+          toastPercent.innerText = '100%';
+          toastTitle.innerText = 'Sync Complete!';
+          toastDetail.innerText = data.message;
+          toastLog.innerHTML += `<div style="color:#10b981; font-weight:bold;">[DONE] ${{data.message}}</div>`;
+          es.close();
+          btn.innerText = 'Sync Now';
+          refreshStats();
+          if (!currentQuery && !currentTag) {{
+            loadLikes(false);
+          }}
+          setTimeout(() => {{
+            toast.style.display = 'none';
+          }}, 4000);
+        }}
+      }};
+      es.onerror = function() {{
+        toastTitle.innerText = 'Sync Ended';
+        es.close();
+        btn.innerText = 'Sync Now';
+      }};
     }}
 
     window.addEventListener('DOMContentLoaded', () => {{
@@ -738,54 +844,6 @@ async def index():
       await fetch('/api/auth/disconnect', {{ method: 'POST' }});
       alert('Disconnected.'); location.reload();
     }}
-    function startSyncStream() {{
-      const drawer = document.getElementById('sync-drawer');
-      const progressFill = document.getElementById('progress-fill');
-      const percentText = document.getElementById('sync-percent-text');
-      const statusTitle = document.getElementById('sync-status-title');
-      const feed = document.getElementById('feed-terminal');
-      const btn = document.getElementById('btn-sync');
-      
-      drawer.style.display = 'block';
-      feed.innerHTML = '';
-      btn.disabled = true; btn.innerText = 'Syncing...';
-
-      const es = new EventSource('/api/sync/stream?max_tweets=0');
-      es.onmessage = function(e) {{
-        const data = JSON.parse(e.data);
-        if (data.error) {{
-          statusTitle.innerText = 'Sync Error';
-          feed.innerHTML += `<div style="color:#ef4444;">[ERROR] ${{data.error}}</div>`;
-          es.close();
-          btn.disabled = false; btn.innerText = 'Sync Now';
-          if (data.error.includes('connect')) openAuthModal();
-          return;
-        }}
-        if (data.stage === 'scrolling') {{
-          statusTitle.innerText = `[Scroll #${{data.scroll_attempt}}] Scraped ${{data.tweets_found}} likes...`;
-          feed.innerHTML += `<div>[Scroll #${{data.scroll_attempt}}] ${{data.page_url}} | Found: <strong style="color:#10b981;">${{data.tweets_found}}</strong> likes (Height: ${{data.height}}px)</div>`;
-          feed.scrollTop = feed.scrollHeight;
-        }} else if (data.stage === 'item_done') {{
-          statusTitle.innerText = `Ingesting (#${{data.current}})...`;
-          const unlikeTag = data.unliked ? ' <span style="color:#ef4444;">[Unliked on X]</span>' : '';
-          feed.innerHTML += `<div>[Stage 1 Ingested] <strong style="color:var(--primary)">@${{data.author_handle || 'user'}}</strong>: "${{data.text}}" <span style="color:#10b981;">[${{data.tags.join(', ')}}]</span>${{unlikeTag}}</div>`;
-          feed.scrollTop = feed.scrollHeight;
-        }} else if (data.stage === 'complete') {{
-          progressFill.style.width = '100%';
-          percentText.innerText = '100%';
-          statusTitle.innerText = 'Sync Complete!';
-          feed.innerHTML += `<div style="color:#10b981; font-weight:bold;">[DONE] ${{data.message}}</div>`;
-          es.close();
-          btn.disabled = false; btn.innerText = 'Sync Now';
-          setTimeout(() => location.reload(), 2000);
-        }}
-      }};
-      es.onerror = function() {{
-        statusTitle.innerText = 'Connection Closed';
-        es.close();
-        btn.disabled = false; btn.innerText = 'Sync Now';
-      }};
-    }}
     async function uploadArchive(input) {{
       if (!input.files || !input.files[0]) return;
       const file = input.files[0];
@@ -793,7 +851,7 @@ async def index():
       formData.append('file', file);
       const res = await fetch('/api/ingest/archive', {{ method: 'POST', body: formData }});
       const data = await res.json();
-      if (res.ok) {{ alert(`Imported ${{data.parsed}} likes from archive!`); location.reload(); }}
+      if (res.ok) {{ alert(`Imported ${{data.parsed}} likes from archive!`); refreshStats(); loadLikes(false); }}
       else {{ alert('Import failed.'); }}
     }}
     async function exportMarkdown() {{
