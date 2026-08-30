@@ -116,20 +116,28 @@ class LanceDBStore:
         if where_expr:
             q = q.where(where_expr)
 
-        if not query and sort_by == "newest":
-            return q.offset(offset).limit(limit).to_list()
-
         items = q.to_list()
         if query:
             q_lower = query.lower()
             items = [t for t in items if q_lower in t.get("text", "").lower() or q_lower in t.get("author_handle", "").lower() or q_lower in t.get("author_name", "").lower()]
 
-        if sort_by == "oldest":
-            items.sort(key=lambda x: x.get("created_at") or x.get("id") or "")
-        elif sort_by == "author":
-            items.sort(key=lambda x: (x.get("author_handle") or "").lower())
+        def get_tweet_numeric_id(x: dict[str, Any]) -> int:
+            tid = str(x.get("tweet_id") or x.get("id") or "0")
+            digits = "".join(c for c in tid if c.isdigit())
+            return int(digits) if digits else 0
+
+        if sort_by in ("newest_liked", "newest"):
+            items.reverse()
+        elif sort_by in ("oldest_liked", "oldest"):
+            # Earliest liked first (natural insertion order)
+            pass
+        elif sort_by == "newest_tweeted":
+            items.sort(key=get_tweet_numeric_id, reverse=True)
+        elif sort_by == "oldest_tweeted":
+            items.sort(key=get_tweet_numeric_id)
         elif sort_by == "media_only":
-            items = [t for t in items if t.get("media_urls") or t.get("local_media_paths")]
+            items = [t for t in items if (t.get("media_urls") and len(t["media_urls"]) > 0) or (t.get("local_media_paths") and len(t["local_media_paths"]) > 0)]
+            items.reverse()
         else:
             items.reverse()
 

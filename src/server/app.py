@@ -596,9 +596,10 @@ async def index():
         <div style="display:flex; gap:8px; align-items:center;">
           <!-- Sort Selector -->
           <select id="select-sort" class="sort-select" onchange="changeSort(this.value)">
-            <option value="newest">⚡ Newest</option>
-            <option value="oldest">🕰️ Oldest</option>
-            <option value="author">👤 Author</option>
+            <option value="newest_liked">⚡ Newest Liked</option>
+            <option value="oldest_liked">🕰️ Oldest Liked</option>
+            <option value="newest_tweeted">🐦 Newest Tweeted</option>
+            <option value="oldest_tweeted">📜 Oldest Tweeted</option>
             <option value="media_only">🖼️ Media Only</option>
           </select>
 
@@ -877,7 +878,7 @@ async def index():
     let currentQuery = '';
     let currentTag = null;
     let currentAuthor = null;
-    let currentSort = 'newest';
+    let currentSort = localStorage.getItem('likes_sort') || 'newest_liked';
     let isSemantic = false;
     let currentOffset = 0;
     let isLoading = false;
@@ -977,6 +978,7 @@ async def index():
 
     function changeSort(val) {{
       currentSort = val;
+      localStorage.setItem('likes_sort', val);
       loadLikes(false);
     }}
 
@@ -1699,6 +1701,8 @@ async def index():
       const savedSimilarLimit = localStorage.getItem('hud_similar_limit') || '4';
       const similarLimitSelect = document.getElementById('setting-similar-count');
       if (similarLimitSelect) similarLimitSelect.value = savedSimilarLimit;
+      const sortSelect = document.getElementById('select-sort');
+      if (sortSelect) sortSelect.value = currentSort;
       loadLikes(false);
       setTimeout(prefetchTopTags, 500);
     }});

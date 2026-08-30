@@ -62,3 +62,16 @@ def test_lancedb_crud(temp_lancedb):
     # Test FTS / vector search
     results = temp_lancedb.search_hybrid(query="LLMs")
     assert len(results) >= 1
+
+    # Test Sorting
+    newest_liked = temp_lancedb.search_hybrid(sort_by="newest_liked")
+    assert newest_liked[0]["tweet_id"] == "1002"
+
+    oldest_liked = temp_lancedb.search_hybrid(sort_by="oldest_liked")
+    assert oldest_liked[0]["tweet_id"] == "1001"
+
+    newest_tweeted = temp_lancedb.search_hybrid(sort_by="newest_tweeted")
+    assert newest_tweeted[0]["tweet_id"] == "1002"
+
+    oldest_tweeted = temp_lancedb.search_hybrid(sort_by="oldest_tweeted")
+    assert oldest_tweeted[0]["tweet_id"] == "1001"
