@@ -155,7 +155,7 @@ async def search_likes(
     tag: str | None = Query(None, description="Tag filter"),
     semantic: bool = Query(False, description="Enable vector semantic search"),
     offset: int = Query(0, ge=0),
-    limit: int = Query(15, ge=1, le=100),
+    limit: int = Query(24, ge=1, le=100),
 ):
     vector = embedder.embed_text(q.strip()) if semantic and q.strip() else None
     results = store.search_hybrid(query=q.strip(), query_vector=vector, tag=tag, offset=offset, limit=limit)
@@ -201,10 +201,10 @@ async def index():
   <title>𝕏 Likes Organizer</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
-    :root {{ --bg: #090a0f; --card: #12151f; --border: #232936; --primary: #1d9bf0; --text: #e2e8f0; --muted: #94a3b8; --success: #10b981; --warn: #f59e0b; }}
+    :root {{ --bg: #090a0f; --card: #12151f; --border: #232936; --primary: #1d9bf0; --text: #e2e8f0; --muted: #94a3b8; --success: #10b981; }}
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); padding: 2rem; }}
-    .container {{ max-width: 1200px; margin: 0 auto; }}
+    .container {{ max-width: 1280px; margin: 0 auto; }}
     header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 1rem; margin-bottom: 1.5rem; }}
     .auth-banner {{ display: flex; align-items: center; gap: 0.75rem; background: var(--card); border: 1px solid var(--border); padding: 0.5rem 0.9rem; border-radius: 8px; font-size: 0.85rem; }}
     .dot {{ width: 8px; height: 8px; border-radius: 50%; display: inline-block; }}
@@ -221,25 +221,31 @@ async def index():
     button {{ background: var(--primary); color: white; border: none; padding: 0.55rem 1.1rem; border-radius: 6px; cursor: pointer; font-weight: 500; font-size: 0.85rem; }}
     button.secondary {{ background: #27272a; color: var(--text); }}
     button:hover {{ opacity: 0.9; }}
-    .controls-row {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }}
-    .view-switcher {{ display: flex; gap: 0.35rem; background: var(--card); border: 1px solid var(--border); padding: 0.3rem; border-radius: 8px; }}
-    .view-btn {{ background: transparent; color: var(--muted); border: none; padding: 0.35rem 0.75rem; border-radius: 5px; cursor: pointer; font-size: 0.8rem; }}
-    .view-btn.active {{ background: rgba(29,155,240,0.2); color: var(--primary); font-weight: 600; }}
-    .tag-cloud {{ display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1.5rem; }}
+    .controls-row {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem; flex-wrap: wrap; gap: 0.75rem; }}
+    .toolbar-group {{ display: flex; gap: 0.5rem; align-items: center; }}
+    .btn-group {{ display: flex; gap: 0.25rem; background: var(--card); border: 1px solid var(--border); padding: 0.25rem; border-radius: 8px; }}
+    .icon-btn {{ background: transparent; color: var(--muted); border: none; padding: 0.35rem 0.55rem; border-radius: 5px; cursor: pointer; display: flex; align-items: center; gap: 0.3rem; font-size: 0.75rem; }}
+    .icon-btn svg {{ width: 15px; height: 15px; fill: currentColor; stroke: currentColor; }}
+    .icon-btn.active {{ background: rgba(29,155,240,0.2); color: var(--primary); font-weight: bold; }}
+    .tag-cloud {{ display: flex; flex-wrap: wrap; gap: 0.5rem; flex: 1; }}
     .tag {{ background: rgba(29,155,240,0.15); color: var(--primary); padding: 0.25rem 0.6rem; border-radius: 999px; font-size: 0.8rem; cursor: pointer; transition: all 0.2s ease; }}
     .tag:hover {{ background: rgba(29,155,240,0.3); }}
     .tag.active {{ background: var(--primary); color: #fff; font-weight: bold; }}
-    #results.view-1col {{ display: flex; flex-direction: column; gap: 1rem; max-width: 800px; margin: 0 auto; }}
-    #results.view-2col {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 1rem; }}
-    #results.view-3col {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }}
-    #results.view-compact {{ display: flex; flex-direction: column; gap: 0.4rem; }}
-    @media (max-width: 900px) {{ #results.view-3col {{ grid-template-columns: repeat(2, 1fr); }} }}
-    @media (max-width: 650px) {{ #results.view-2col, #results.view-3col {{ grid-template-columns: 1fr; }} }}
-    .tweet-card {{ background: var(--card); border: 1px solid var(--border); padding: 1.25rem; border-radius: 8px; transition: transform 0.15s ease; }}
+    #results.cols-1 {{ display: grid; grid-template-columns: 1fr; max-width: 820px; margin: 0 auto; gap: 1rem; }}
+    #results.cols-2 {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 1rem; }}
+    #results.cols-3 {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }}
+    #results.cols-4 {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.85rem; }}
+    @media (max-width: 1024px) {{ #results.cols-4 {{ grid-template-columns: repeat(3, 1fr); }} }}
+    @media (max-width: 768px) {{ #results.cols-3, #results.cols-4 {{ grid-template-columns: repeat(2, 1fr); }} }}
+    @media (max-width: 550px) {{ #results.cols-2, #results.cols-3, #results.cols-4 {{ grid-template-columns: 1fr; }} }}
+    .tweet-card {{ background: var(--card); border: 1px solid var(--border); padding: 1.25rem; border-radius: 8px; display: flex; flex-direction: column; justify-content: space-between; }}
     .tweet-card:hover {{ border-color: rgba(29,155,240,0.4); }}
     .tweet-header {{ display: flex; justify-content: space-between; color: var(--muted); font-size: 0.85rem; margin-bottom: 0.5rem; }}
     .compact-row {{ display: flex; justify-content: space-between; align-items: center; background: var(--card); border: 1px solid var(--border); padding: 0.75rem 1rem; border-radius: 6px; gap: 1rem; font-size: 0.85rem; }}
     .compact-text {{ flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+    .gallery-card {{ background: var(--card); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; display: flex; flex-direction: column; }}
+    .gallery-img {{ width: 100%; height: 220px; object-fit: cover; border-bottom: 1px solid var(--border); }}
+    .gallery-body {{ padding: 0.85rem; }}
     .sync-drawer {{ display: none; background: #0e111a; border: 1px solid var(--border); border-radius: 8px; padding: 1.25rem; margin-bottom: 1.5rem; }}
     .progress-bar-bg {{ background: #1e2330; border-radius: 6px; height: 10px; overflow: hidden; margin: 0.75rem 0; }}
     .progress-bar-fill {{ background: linear-gradient(90deg, #1d9bf0, #10b981); height: 100%; width: 0%; transition: width 0.3s ease; }}
@@ -309,7 +315,7 @@ async def index():
         <div id="progress-fill" class="progress-bar-fill"></div>
       </div>
       <div id="feed-terminal" class="feed-terminal">
-        <div>[Ready] Decoupled 2-stage pipeline with unified Sync ON/OFF controls.</div>
+        <div>[Ready] Multi-column switcher with SVG controls & lazy loading.</div>
       </div>
     </div>
 
@@ -330,16 +336,40 @@ async def index():
     </div>
 
     <div class="controls-row">
-      <div class="tag-cloud" style="margin-bottom:0;">{tags_html}</div>
-      <div class="view-switcher">
-        <button class="view-btn" id="btn-view-1col" onclick="setViewMode('1col')">1 Col</button>
-        <button class="view-btn active" id="btn-view-2col" onclick="setViewMode('2col')">2 Col</button>
-        <button class="view-btn" id="btn-view-3col" onclick="setViewMode('3col')">3 Col</button>
-        <button class="view-btn" id="btn-view-compact" onclick="setViewMode('compact')">List</button>
+      <div class="tag-cloud">{tags_html}</div>
+      <div class="toolbar-group">
+        <!-- SVG Columns Selector (1, 2, 3, 4) -->
+        <div class="btn-group" title="Column count">
+          <button class="icon-btn" id="btn-cols-1" onclick="setCols('1')">
+            <svg viewBox="0 0 24 24"><rect x="5" y="3" width="14" height="18" rx="2"/></svg> 1
+          </button>
+          <button class="icon-btn" id="btn-cols-2" onclick="setCols('2')">
+            <svg viewBox="0 0 24 24"><rect x="3" y="3" width="8" height="18" rx="1.5"/><rect x="13" y="3" width="8" height="18" rx="1.5"/></svg> 2
+          </button>
+          <button class="icon-btn" id="btn-cols-3" onclick="setCols('3')">
+            <svg viewBox="0 0 24 24"><rect x="2" y="3" width="5.3" height="18" rx="1"/><rect x="9.3" y="3" width="5.3" height="18" rx="1"/><rect x="16.6" y="3" width="5.3" height="18" rx="1"/></svg> 3
+          </button>
+          <button class="icon-btn" id="btn-cols-4" onclick="setCols('4')">
+            <svg viewBox="0 0 24 24"><rect x="2" y="3" width="3.5" height="18" rx="0.8"/><rect x="7.5" y="3" width="3.5" height="18" rx="0.8"/><rect x="13" y="3" width="3.5" height="18" rx="0.8"/><rect x="18.5" y="3" width="3.5" height="18" rx="0.8"/></svg> 4
+          </button>
+        </div>
+
+        <!-- Display Mode Selector (Card, List, Gallery) -->
+        <div class="btn-group" title="Display mode">
+          <button class="icon-btn" id="btn-mode-card" onclick="setDisplayMode('card')">
+            <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="7" y1="8" x2="17" y2="8"/><line x1="7" y1="12" x2="14" y2="12"/></svg> Cards
+          </button>
+          <button class="icon-btn" id="btn-mode-list" onclick="setDisplayMode('list')">
+            <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="20" y2="18"/></svg> List
+          </button>
+          <button class="icon-btn" id="btn-mode-gallery" onclick="setDisplayMode('gallery')">
+            <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5" fill="currentColor"/><path d="M21 15l-5-5L5 21"/></svg> Gallery
+          </button>
+        </div>
       </div>
     </div>
 
-    <div id="results" class="view-2col"></div>
+    <div id="results" class="cols-2 mode-card"></div>
     <div id="scroll-sentinel" style="height:20px; margin-top:1rem;"></div>
   </div>
 
@@ -404,20 +434,37 @@ async def index():
     let currentOffset = 0;
     let isLoading = false;
     let hasMore = true;
-    let viewMode = localStorage.getItem('likes_view_mode') || '2col';
+    let colCount = localStorage.getItem('likes_cols') || '2';
+    let displayMode = localStorage.getItem('likes_mode') || 'card';
     let nextSyncSeconds = {sched.get('next_sync_in_sec', 0)};
     let isSyncEnabled = {str(sched.get('enabled', True)).lower()};
     let syncInterval = {sched.get('interval_sec', 600)};
-    const PAGE_LIMIT = 18;
+    const PAGE_LIMIT = 24;
 
-    function setViewMode(mode) {{
-      viewMode = mode;
-      localStorage.setItem('likes_view_mode', mode);
-      document.querySelectorAll('.view-btn').forEach(b => b.classList.remove('active'));
-      const activeBtn = document.getElementById('btn-view-' + mode);
-      if (activeBtn) activeBtn.classList.add('active');
+    function applyLayout() {{
       const results = document.getElementById('results');
-      results.className = 'view-' + mode;
+      results.className = (displayMode === 'list' ? 'cols-1' : 'cols-' + colCount) + ' mode-' + displayMode;
+      
+      document.querySelectorAll('[id^=\"btn-cols-\"]').forEach(b => b.classList.remove('active'));
+      const colBtn = document.getElementById('btn-cols-' + colCount);
+      if (colBtn) colBtn.classList.add('active');
+
+      document.querySelectorAll('[id^=\"btn-mode-\"]').forEach(b => b.classList.remove('active'));
+      const modeBtn = document.getElementById('btn-mode-' + displayMode);
+      if (modeBtn) modeBtn.classList.add('active');
+    }}
+
+    function setCols(c) {{
+      colCount = c;
+      localStorage.setItem('likes_cols', c);
+      applyLayout();
+      loadLikes(false);
+    }}
+
+    function setDisplayMode(m) {{
+      displayMode = m;
+      localStorage.setItem('likes_mode', m);
+      applyLayout();
       loadLikes(false);
     }}
 
@@ -456,7 +503,7 @@ async def index():
         }}
 
         const html = results.map(r => {{
-          if (viewMode === 'compact') {{
+          if (displayMode === 'list') {{
             return `
               <div class="compact-row">
                 <span style="font-weight:600; color:var(--primary); min-width:120px;">@${{r.author_handle || 'user'}}</span>
@@ -466,11 +513,26 @@ async def index():
               </div>
             `;
           }}
+          if (displayMode === 'gallery') {{
+            const mediaSrc = (r.media_urls && r.media_urls.length) ? r.media_urls[0] : '';
+            return `
+              <div class="gallery-card">
+                ${{mediaSrc ? `<img class="gallery-img" src="${{mediaSrc}}" loading="lazy">` : '<div style=\"height:120px; background:#1a202c; display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:0.8rem;\">Text Post</div>'}}
+                <div class="gallery-body">
+                  <div class="tweet-header"><span><strong>${{r.author_name || 'User'}}</strong></span><a href="${{r.url}}" target="_blank" style="color:var(--primary)">View</a></div>
+                  <p style="font-size:0.82rem; line-height:1.3; margin-bottom:0.5rem; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden;">${{r.text}}</p>
+                  <div>${{(r.tags || []).slice(0, 3).map(t => `<span class="tag" style="font-size:0.7rem; padding:0.1rem 0.4rem;" onclick="filterTag('${{t}}')">${{t}}</span>`).join(' ')}}</div>
+                </div>
+              </div>
+            `;
+          }}
           return `
             <div class="tweet-card">
-              <div class="tweet-header"><span><strong>${{r.author_name || 'User'}}</strong> <span style="color:var(--muted)">@${{r.author_handle || 'user'}}</span></span><a href="${{r.url}}" target="_blank" style="color:var(--primary)">View on X</a></div>
-              <p style="white-space:pre-wrap; line-height:1.4;">${{r.text}}</p>
-              ${{r.media_urls && r.media_urls.length ? `<div class="media-grid">${{r.media_urls.map(m => `<img class="media-thumb" src="${{m}}" loading="lazy">`).join('')}}</div>` : ''}}
+              <div>
+                <div class="tweet-header"><span><strong>${{r.author_name || 'User'}}</strong> <span style="color:var(--muted)">@${{r.author_handle || 'user'}}</span></span><a href="${{r.url}}" target="_blank" style="color:var(--primary)">View on X</a></div>
+                <p style="white-space:pre-wrap; line-height:1.4;">${{r.text}}</p>
+                ${{r.media_urls && r.media_urls.length ? `<div class="media-grid">${{r.media_urls.map(m => `<img class="media-thumb" src="${{m}}" loading="lazy">`).join('')}}</div>` : ''}}
+              </div>
               <div style="margin-top:0.75rem">${{(r.tags || []).map(t => `<span class="tag" onclick="filterTag('${{t}}')">${{t}}</span>`).join(' ')}}</div>
             </div>
           `;
@@ -515,7 +577,6 @@ async def index():
     }}, {{ rootMargin: '300px' }});
     observer.observe(document.getElementById('scroll-sentinel'));
 
-    // Countdown timer ticker
     setInterval(() => {{
       const cd = document.getElementById('sync-countdown');
       if (!isSyncEnabled || syncInterval === 0) {{
@@ -526,9 +587,7 @@ async def index():
       const m = Math.floor(nextSyncSeconds / 60);
       const s = nextSyncSeconds % 60;
       cd.innerText = `Next: ${{m.toString().padStart(2, '0')}}:${{s.toString().padStart(2, '0')}}`;
-      if (nextSyncSeconds === 0) {{
-        nextSyncSeconds = syncInterval;
-      }}
+      if (nextSyncSeconds === 0) nextSyncSeconds = syncInterval;
     }}, 1000);
 
     async function toggleAutoSync() {{
@@ -554,7 +613,8 @@ async def index():
     }}
 
     window.addEventListener('DOMContentLoaded', () => {{
-      setViewMode(viewMode);
+      applyLayout();
+      loadLikes(false);
     }});
 
     function openAuthModal() {{ document.getElementById('auth-modal').style.display = 'flex'; }}
