@@ -1636,16 +1636,35 @@ async def index():
       try {{
         const res = await fetch('/api/stats');
         const st = await res.json();
-        document.getElementById('stat-total').innerText = st.total_likes;
-        document.getElementById('stat-media').innerText = st.archived_media_files;
-        document.getElementById('stat-tags').innerText = st.tags_count;
+        const statTotal = document.getElementById('stat-total');
+        const statMedia = document.getElementById('stat-media');
+        const statTags = document.getElementById('stat-tags');
+        if (statTotal && st.total_likes !== undefined) statTotal.innerText = st.total_likes;
+        if (statMedia && st.archived_media_files !== undefined) statMedia.innerText = st.archived_media_files;
+        if (statTags && st.tags_count !== undefined) statTags.innerText = st.tags_count;
         
+        const schedRes = await fetch('/api/scheduler/status');
+        const schedData = await schedRes.json();
+        isSyncEnabled = schedData.enabled;
+        syncInterval = schedData.interval_sec;
+        if (schedData.is_running) {{
+          const cd = document.getElementById('sync-countdown');
+          if (cd) cd.innerText = 'Syncing...';
+        }} else if (schedData.next_sync_in_sec !== undefined) {{
+          nextSyncSeconds = schedData.next_sync_in_sec;
+        }}
+
         const tagsRes = await fetch('/api/tags');
         const tagsData = await tagsRes.json();
-        currentRawTags = tagsData.tags || [];
-        renderTagCloud();
+        if (tagsData.tags && tagsData.tags.length !== currentRawTags.length) {{
+          currentRawTags = tagsData.tags || [];
+          renderTagCloud();
+        }}
       }} catch (e) {{}}
     }}
+
+    // Real-time live polling for HUD telemetry stats and sync countdown
+    setInterval(refreshStats, 4000);
 
     /* RAG Chat Drawer Logic */
     function toggleChatDrawer() {{
