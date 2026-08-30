@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -254,8 +255,8 @@ async def export_markdown():
 @app.get("/", response_class=HTMLResponse)
 async def index():
     stats = store.get_stats()
-    tags = store.get_all_tags()[:30]
-    tags_html = "".join([f"<span class='hud-tag' id='tag-{t['tag']}' onclick='filterTag(\"{t['tag']}\")'>{t['tag']} <span class='tag-count'>{t['count']}</span></span>" for t in tags])
+    tags = store.get_all_tags()
+    tags_json = json.dumps(tags)
     auth = scraper.get_session_status()
     sched = scheduler.get_status()
     notifs = history.get_notifications(limit=10)
@@ -341,8 +342,18 @@ async def index():
     .hud-tag {{ background: rgba(29, 155, 240, 0.1); color: #7dd3fc; border: 1px solid rgba(29, 155, 240, 0.25); padding: 0.25rem 0.6rem; border-radius: 999px; font-size: 0.75rem; cursor: pointer; transition: all 0.15s ease; }}
     .hud-tag:hover {{ background: rgba(29, 155, 240, 0.25); border-color: rgba(29, 155, 240, 0.5); }}
     .hud-tag.active {{ background: #0284c7; color: #fff; font-weight: bold; border-color: #38bdf8; box-shadow: 0 0 10px rgba(56, 189, 248, 0.4); }}
+    .hud-tag-toggle {{ background: rgba(255, 255, 255, 0.08); color: #94a3b8; border: 1px dashed rgba(255, 255, 255, 0.25); padding: 0.25rem 0.65rem; border-radius: 999px; font-size: 0.75rem; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; transition: all 0.15s ease; white-space: nowrap; flex-shrink: 0; }}
+    .hud-tag-toggle:hover {{ background: rgba(255, 255, 255, 0.16); color: #fff; border-color: rgba(255, 255, 255, 0.45); }}
     .tag-count {{ font-size: 0.7rem; opacity: 0.7; font-family: 'JetBrains Mono', monospace; }}
     .active-author-pill {{ background: rgba(99, 102, 241, 0.25); color: #c7d2fe; border: 1px solid #6366f1; padding: 0.25rem 0.65rem; border-radius: 999px; font-size: 0.75rem; font-family: 'JetBrains Mono', monospace; cursor: pointer; display: inline-flex; align-items: center; gap: 5px; }}
+
+    /* Unified Settings Group Styling */
+    .settings-group {{ background: rgba(0, 0, 0, 0.35); border: 1px solid var(--card-border); border-radius: 10px; padding: 0.9rem; margin-bottom: 0.85rem; }}
+    .settings-title {{ font-size: 0.82rem; font-weight: 700; color: #e2e8f0; margin-bottom: 0.65rem; display: flex; align-items: center; gap: 6px; }}
+    .settings-row {{ display: flex; justify-content: space-between; align-items: center; padding: 0.45rem 0; border-bottom: 1px solid rgba(255, 255, 255, 0.05); gap: 10px; }}
+    .settings-row:last-child {{ border-bottom: none; }}
+    .settings-label {{ font-size: 0.78rem; font-weight: 600; color: #cbd5e1; }}
+    .settings-desc {{ font-size: 0.7rem; color: var(--muted); line-height: 1.25; margin-top: 2px; }}
 
     /* Multi-Column Layout Grid */
     #results.cols-1 {{ display: grid; grid-template-columns: 1fr; max-width: 820px; margin: 0 auto; gap: 1rem; }}
@@ -492,7 +503,7 @@ async def index():
         </svg>
         <span>𝕏 LIKES HUD</span>
       </a>
-      <span class="hud-badge {'connected' if auth['connected'] else 'disconnected'}" onclick="openAccountTab()" title="Manage Twitter Session">
+      <span class="hud-badge {'connected' if auth['connected'] else 'disconnected'}" onclick="openSettingsTab()" title="Manage Twitter Session & Settings">
         <span class="dot {'connected' if auth['connected'] else 'disconnected'}"></span>
         {f'@{auth["username"]}' if auth['connected'] and auth['username'] else ('ONLINE' if auth['connected'] else 'OFFLINE')}
       </span>
@@ -513,50 +524,20 @@ async def index():
         <svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
       </button>
 
-      <!-- Auto-Sync Toggle Icon Button -->
-      <button id="btn-auto-sync-icon" class="hud-icon-btn {'active' if sched['enabled'] else ''}" onclick="toggleAutoSync()" title="Toggle Auto-Sync ({'ON' if sched['enabled'] else 'OFF'})">
-        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-      </button>
-
-      <!-- Sync Interval Selector -->
-      <select id="select-interval" class="sync-select desktop-only" onchange="changeSyncInterval(this.value)" title="Sync Cycle Interval">
-        <option value="300" {'selected' if sched['interval_sec'] == 300 else ''}>5m</option>
-        <option value="600" {'selected' if sched['interval_sec'] == 600 else ''}>10m</option>
-        <option value="1800" {'selected' if sched['interval_sec'] == 1800 else ''}>30m</option>
-        <option value="3600" {'selected' if sched['interval_sec'] == 3600 else ''}>1h</option>
-        <option value="0" {'selected' if sched['interval_sec'] == 0 else ''}>Manual</option>
-      </select>
-
-      <!-- Auto-Unlike Toggle Icon Button -->
-      <button id="btn-auto-unlike-icon" class="hud-icon-btn desktop-only {'active' if sched.get('auto_unlike') else ''}" onclick="toggleAutoUnlike()" title="Toggle Auto-Unlike on X ({'ON' if sched.get('auto_unlike') else 'OFF'})">
-        <svg viewBox="0 0 24 24"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/><path d="m12 5-1 4 2 3-2 4"/></svg>
-      </button>
-
       <!-- Sync Now Trigger Button -->
       <button id="btn-sync-icon" class="hud-icon-btn accent" onclick="startSyncStream()" title="Trigger Immediate Sync [Stream]">
         <svg viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
       </button>
 
       <!-- Logs & Notification Sidesheet Button -->
-      <button class="hud-icon-btn" onclick="toggleSidesheet()" title="Telemetry Logs & Notifications">
+      <button class="hud-icon-btn" onclick="toggleSidesheet('logs')" title="Telemetry Logs & Notifications">
         <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
         {f'<span class="badge-corner" id="unread-badge">{unread}</span>' if unread > 0 else '<span id="unread-badge"></span>'}
       </button>
 
-      <!-- Import Archive Icon Button -->
-      <button class="hud-icon-btn desktop-only" onclick="document.getElementById('file-upload').click()" title="Import Twitter like.js Archive">
-        <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-      </button>
-      <input type="file" id="file-upload" style="display:none" onchange="uploadArchive(this)">
-
-      <!-- Export Markdown Icon Button -->
-      <button class="hud-icon-btn desktop-only" onclick="exportMarkdown()" title="Export All Tweets to Markdown Files">
-        <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-      </button>
-
-      <!-- Account & Maintenance Button -->
-      <button class="hud-icon-btn" onclick="openAccountTab()" title="Twitter Account & Maintenance Tools">
-        <svg viewBox="0 0 24 24"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+      <!-- Settings Sidesheet Button -->
+      <button class="hud-icon-btn" onclick="openSettingsTab()" title="HUD & Sync Settings">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
       </button>
     </div>
   </header>
@@ -582,41 +563,32 @@ async def index():
       <div class="controls-row">
         <div class="hud-tag-cloud" id="tag-cloud-container">
           <span id="active-author-filter-slot"></span>
-          {tags_html}
         </div>
 
         <div style="display:flex; gap:8px; align-items:center;">
           <!-- Sort Selector -->
           <select id="select-sort" class="sort-select" onchange="changeSort(this.value)">
-            <option value="newest">Newest First</option>
-            <option value="oldest">Oldest First</option>
-            <option value="media_only">Media Only</option>
-            <option value="author">Author A-Z</option>
+            <option value="newest">⚡ Newest</option>
+            <option value="oldest">🕰️ Oldest</option>
+            <option value="author">👤 Author</option>
+            <option value="media_only">🖼️ Media Only</option>
           </select>
 
-          <!-- Columns Selector (1, 2, 3, 4) -->
-          <div class="btn-group" title="Column Layout">
-            <button class="icon-btn" id="btn-cols-1" onclick="setCols('1')">
-              <svg viewBox="0 0 24 24"><rect x="5" y="3" width="14" height="18" rx="2"/></svg> 1
-            </button>
-            <button class="icon-btn" id="btn-cols-2" onclick="setCols('2')">
-              <svg viewBox="0 0 24 24"><rect x="3" y="3" width="8" height="18" rx="1.5"/><rect x="13" y="3" width="8" height="18" rx="1.5"/></svg> 2
-            </button>
-            <button class="icon-btn" id="btn-cols-3" onclick="setCols('3')">
-              <svg viewBox="0 0 24 24"><rect x="2" y="3" width="5.3" height="18" rx="1"/><rect x="9.3" y="3" width="5.3" height="18" rx="1"/><rect x="16.6" y="3" width="5.3" height="18" rx="1"/></svg> 3
-            </button>
-            <button class="icon-btn" id="btn-cols-4" onclick="setCols('4')">
-              <svg viewBox="0 0 24 24"><rect x="2" y="3" width="3.5" height="18" rx="0.8"/><rect x="7.5" y="3" width="3.5" height="18" rx="0.8"/><rect x="13" y="3" width="3.5" height="18" rx="0.8"/><rect x="18.5" y="3" width="3.5" height="18" rx="0.8"/></svg> 4
-            </button>
+          <!-- Column Pickers -->
+          <div class="btn-group desktop-only">
+            <button class="icon-btn" id="btn-cols-1" onclick="setCols('1')">1</button>
+            <button class="icon-btn active" id="btn-cols-2" onclick="setCols('2')">2</button>
+            <button class="icon-btn" id="btn-cols-3" onclick="setCols('3')">3</button>
+            <button class="icon-btn" id="btn-cols-4" onclick="setCols('4')">4</button>
           </div>
 
-          <!-- Display Mode Selector (Cards, List, Gallery) -->
-          <div class="btn-group" title="Display Style">
-            <button class="icon-btn" id="btn-mode-card" onclick="setDisplayMode('card')">
-              <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="7" y1="8" x2="17" y2="8"/><line x1="7" y1="12" x2="14" y2="12"/></svg> Cards
+          <!-- Layout Mode Switcher -->
+          <div class="btn-group">
+            <button class="icon-btn active" id="btn-mode-card" onclick="setDisplayMode('card')">
+              <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg> Cards
             </button>
             <button class="icon-btn" id="btn-mode-list" onclick="setDisplayMode('list')">
-              <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="20" y2="18"/></svg> List
+              <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg> List
             </button>
             <button class="icon-btn" id="btn-mode-gallery" onclick="setDisplayMode('gallery')">
               <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5" fill="currentColor"/><path d="M21 15l-5-5L5 21"/></svg> Gallery
@@ -694,13 +666,13 @@ async def index():
   <aside class="hud-sidesheet" id="hud-sidesheet">
     <div class="mobile-drag-handle"></div>
     <div class="hud-sidesheet-header">
-      <h3 style="font-size:0.95rem; font-weight:700;">HUD Telemetry & Controls</h3>
+      <h3 style="font-size:0.95rem; font-weight:700;">HUD Controls & Settings</h3>
       <button class="hud-icon-btn" onclick="toggleSidesheet()" style="width:28px; height:28px;">✕</button>
     </div>
     <div class="hud-tabs">
       <div class="hud-tab active" id="tab-btn-logs" onclick="switchHistTab('logs')">Sync Logs</div>
       <div class="hud-tab" id="tab-btn-notifs" onclick="switchHistTab('notifs')">Alerts</div>
-      <div class="hud-tab" id="tab-btn-auth" onclick="switchHistTab('auth')">Account</div>
+      <div class="hud-tab" id="tab-btn-settings" onclick="switchHistTab('settings')">Settings</div>
     </div>
     <div class="hud-sidesheet-content">
       <div id="tab-logs">
@@ -712,14 +684,119 @@ async def index():
         </div>
         <div id="notifs-container">Loading notifications...</div>
       </div>
-      <div id="tab-auth" style="display:none;">
-        <p style="color:var(--muted); font-size:0.8rem; margin-bottom:0.75rem;">Session authentication & bulk maintenance.</p>
-        <input type="text" id="auth-username" class="hud-input" placeholder="@handle" style="width:100%; margin-bottom:0.5rem; background:#080b12;">
-        <input type="text" id="auth-token" class="hud-input" placeholder="auth_token (required)" style="width:100%; margin-bottom:0.5rem; background:#080b12;">
-        <input type="text" id="auth-ct0" class="hud-input" placeholder="ct0 (optional)" style="width:100%; margin-bottom:0.75rem; background:#080b12;">
-        <button class="hud-btn" onclick="saveCookiesAuth()" style="width:100%; margin-bottom:0.75rem; background:rgba(29,155,240,0.2); border-color:#1d9bf0; color:#38bdf8;">Save Session</button>
-        <button class="hud-btn" onclick="startBulkUnlike()" style="background:rgba(239,68,68,0.2); border-color:#ef4444; color:#f87171; width:100%; margin-bottom:0.75rem;">Clean & Unlike All on X</button>
-        <button class="hud-btn" onclick="disconnectTwitter()" style="width:100%;">Disconnect Account</button>
+      <div id="tab-settings" style="display:none;">
+        <!-- Sync & Automation Section -->
+        <div class="settings-group">
+          <div class="settings-title">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+            Sync & Automation
+          </div>
+          <div class="settings-row">
+            <div>
+              <div class="settings-label">Auto-Sync Loop</div>
+              <div class="settings-desc">Run background sync cycle automatically</div>
+            </div>
+            <button id="setting-auto-sync-btn" class="hud-btn {'active' if sched['enabled'] else ''}" onclick="toggleAutoSync()">
+              <span id="setting-auto-sync-status">{'ON' if sched['enabled'] else 'OFF'}</span>
+            </button>
+          </div>
+          <div class="settings-row">
+            <div>
+              <div class="settings-label">Sync Cycle Interval</div>
+              <div class="settings-desc">Frequency of automated likes ingestion</div>
+            </div>
+            <select id="setting-interval" class="sync-select" onchange="changeSyncInterval(this.value)">
+              <option value="300" {'selected' if sched['interval_sec'] == 300 else ''}>Every 5 minutes</option>
+              <option value="600" {'selected' if sched['interval_sec'] == 600 else ''}>Every 10 minutes</option>
+              <option value="1800" {'selected' if sched['interval_sec'] == 1800 else ''}>Every 30 minutes</option>
+              <option value="3600" {'selected' if sched['interval_sec'] == 3600 else ''}>Every 1 hour</option>
+              <option value="0" {'selected' if sched['interval_sec'] == 0 else ''}>Manual Only</option>
+            </select>
+          </div>
+          <div class="settings-row">
+            <div>
+              <div class="settings-label">Auto-Unlike on 𝕏</div>
+              <div class="settings-desc">Automatically unlike tweets once archived</div>
+            </div>
+            <button id="setting-auto-unlike-btn" class="hud-btn {'active' if sched.get('auto_unlike') else ''}" onclick="toggleAutoUnlike()">
+              <span id="setting-auto-unlike-status">{'ON' if sched.get('auto_unlike') else 'OFF'}</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Display & Filter Preferences -->
+        <div class="settings-group">
+          <div class="settings-title">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>
+            Display & Tag Limits
+          </div>
+          <div class="settings-row">
+            <div>
+              <div class="settings-label">Visible Top Tags (X)</div>
+              <div class="settings-desc">Top tags shown before expanding</div>
+            </div>
+            <select id="setting-top-tags-count" class="sync-select" onchange="updateTopTagsLimit(this.value)">
+              <option value="5">Top 5 Tags</option>
+              <option value="10" selected>Top 10 Tags (Default)</option>
+              <option value="15">Top 15 Tags</option>
+              <option value="20">Top 20 Tags</option>
+              <option value="30">Top 30 Tags</option>
+              <option value="all">Show All Tags</option>
+            </select>
+          </div>
+          <div class="settings-row">
+            <div>
+              <div class="settings-label">Default Feed View</div>
+              <div class="settings-desc">Card layout representation</div>
+            </div>
+            <select id="setting-layout-mode" class="sync-select" onchange="setDisplayMode(this.value)">
+              <option value="card">Rich Cards</option>
+              <option value="list">Compact List</option>
+              <option value="gallery">Media Gallery</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- Twitter Session & Auth -->
+        <div class="settings-group">
+          <div class="settings-title">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+            Twitter Account & Session
+          </div>
+          <p style="color:var(--muted); font-size:0.75rem; margin-bottom:0.75rem;">Status: <span class="hud-badge {'connected' if auth['connected'] else 'disconnected'}">{f'@{auth["username"]}' if auth['connected'] and auth['username'] else ('ONLINE' if auth['connected'] else 'OFFLINE')}</span></p>
+          <input type="text" id="auth-username" class="hud-input" placeholder="@handle" style="width:100%; margin-bottom:0.5rem; background:#080b12;">
+          <input type="text" id="auth-token" class="hud-input" placeholder="auth_token (required)" style="width:100%; margin-bottom:0.5rem; background:#080b12;">
+          <input type="text" id="auth-ct0" class="hud-input" placeholder="ct0 (optional)" style="width:100%; margin-bottom:0.75rem; background:#080b12;">
+          <div style="display:flex; gap:6px;">
+            <button class="hud-btn accent" onclick="saveCookiesAuth()" style="flex:1; justify-content:center;">Save Session</button>
+            <button class="hud-btn" onclick="disconnectTwitter()" style="color:#ef4444; border-color:rgba(239,68,68,0.3);">Disconnect</button>
+          </div>
+        </div>
+
+        <!-- Data Tools & Archive -->
+        <div class="settings-group">
+          <div class="settings-title">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            Data Tools & Maintenance
+          </div>
+          <div style="display:flex; flex-direction:column; gap:8px;">
+            <button class="hud-btn" onclick="document.getElementById('file-upload').click()" style="justify-content:center;">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+              Import Twitter like.js Archive
+            </button>
+            <input type="file" id="file-upload" style="display:none" onchange="uploadArchive(this)">
+
+            <button class="hud-btn" onclick="exportMarkdown()" style="justify-content:center;">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              Export All Likes to Markdown
+            </button>
+
+            <button class="hud-btn" onclick="startBulkUnlike()" style="background:rgba(239,68,68,0.15); border-color:#ef4444; color:#f87171; justify-content:center;">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/><path d="m12 5-1 4 2 3-2 4"/></svg>
+              Clean & Unlike All on 𝕏
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   </aside>
@@ -763,6 +840,45 @@ async def index():
     const loadedTweetsMap = new Map();
     let activeModalTweet = null;
     const PAGE_LIMIT = 24;
+
+    /* Top Tags & Expand/Collapse */
+    let currentRawTags = {tags_json};
+    let topTagsLimit = parseInt(localStorage.getItem('hud_top_tags_limit') || '10');
+    let isTagsExpanded = false;
+
+    function renderTagCloud() {{
+      const container = document.getElementById('tag-cloud-container');
+      if (!container) return;
+      const authorSlot = document.getElementById('active-author-filter-slot')?.outerHTML || '<span id="active-author-filter-slot"></span>';
+      const visibleTags = (isTagsExpanded || topTagsLimit >= currentRawTags.length)
+        ? currentRawTags
+        : currentRawTags.slice(0, topTagsLimit);
+
+      let html = authorSlot;
+      html += visibleTags.map(t => `<span class='hud-tag ${{t.tag === currentTag ? 'active' : ''}}' id='tag-${{t.tag}}' onclick='filterTag("${{t.tag}}")'>${{t.tag}} <span class='tag-count'>${{t.count}}</span></span>`).join('');
+
+      if (currentRawTags.length > topTagsLimit) {{
+        if (!isTagsExpanded) {{
+          const remaining = currentRawTags.length - topTagsLimit;
+          html += `<span class="hud-tag-toggle" onclick="toggleExpandTags()">+${{remaining}} more ▾</span>`;
+        }} else {{
+          html += `<span class="hud-tag-toggle" onclick="toggleExpandTags()">Show Less ▴</span>`;
+        }}
+      }}
+      container.innerHTML = html;
+    }}
+
+    function toggleExpandTags() {{
+      isTagsExpanded = !isTagsExpanded;
+      renderTagCloud();
+    }}
+
+    function updateTopTagsLimit(val) {{
+      topTagsLimit = val === 'all' ? 99999 : parseInt(val);
+      localStorage.setItem('hud_top_tags_limit', val);
+      isTagsExpanded = false;
+      renderTagCloud();
+    }}
 
     function formatTweetText(text) {{
       if (!text) return '';
@@ -1154,8 +1270,8 @@ async def index():
         
         const tagsRes = await fetch('/api/tags');
         const tagsData = await tagsRes.json();
-        const tHtml = (tagsData.tags || []).slice(0, 30).map(t => `<span class='hud-tag ${{t.tag === currentTag ? 'active' : ''}}' id='tag-${{t.tag}}' onclick='filterTag("${{t.tag}}")'>${{t.tag}} <span class='tag-count'>${{t.count}}</span></span>`).join('');
-        document.getElementById('tag-cloud-container').innerHTML = tHtml;
+        currentRawTags = tagsData.tags || [];
+        renderTagCloud();
       }} catch (e) {{}}
     }}
 
@@ -1291,25 +1407,27 @@ async def index():
       `;
     }}
 
-    function toggleSidesheet() {{
+    function toggleSidesheet(preferredTab = null) {{
       const sheet = document.getElementById('hud-sidesheet');
       sheet.classList.toggle('open');
       if (sheet.classList.contains('open')) {{
-        const activeTab = document.querySelector('.hud-tab.active')?.id.replace('tab-btn-', '') || 'logs';
+        const activeTab = preferredTab || document.querySelector('.hud-tab.active')?.id.replace('tab-btn-', '') || 'logs';
         switchHistTab(activeTab);
       }}
     }}
 
-    function openAccountTab() {{
+    function openSettingsTab() {{
       const sheet = document.getElementById('hud-sidesheet');
       if (!sheet.classList.contains('open')) sheet.classList.add('open');
-      switchHistTab('auth');
+      switchHistTab('settings');
     }}
 
     function switchHistTab(t) {{
-      ['logs', 'notifs', 'auth'].forEach(tab => {{
-        document.getElementById('tab-' + tab).style.display = tab === t ? 'block' : 'none';
-        document.getElementById('tab-btn-' + tab).className = 'hud-tab ' + (tab === t ? 'active' : '');
+      ['logs', 'notifs', 'settings'].forEach(tab => {{
+        const el = document.getElementById('tab-' + tab);
+        const btn = document.getElementById('tab-btn-' + tab);
+        if (el) el.style.display = tab === t ? 'block' : 'none';
+        if (btn) btn.className = 'hud-tab ' + (tab === t ? 'active' : '');
       }});
       if (t === 'logs' && !cachedLogs) loadHistoryLogs();
       if (t === 'notifs' && !cachedNotifs) loadNotifications();
@@ -1375,12 +1493,44 @@ async def index():
       loadNotifications();
     }}
 
+    async function toggleAutoSync() {{
+      const res = await fetch('/api/scheduler/toggle', {{ method: 'POST' }});
+      const data = await res.json();
+      isSyncEnabled = data.enabled;
+      nextSyncSeconds = data.status.next_sync_in_sec || syncInterval;
+      const statusEl = document.getElementById('setting-auto-sync-status');
+      if (statusEl) statusEl.innerText = isSyncEnabled ? 'ON' : 'OFF';
+      const btn = document.getElementById('setting-auto-sync-btn');
+      if (btn) {{
+        if (isSyncEnabled) btn.classList.add('active');
+        else btn.classList.remove('active');
+      }}
+    }}
+
+    async function changeSyncInterval(val) {{
+      const sec = parseInt(val);
+      syncInterval = sec;
+      const res = await fetch('/api/scheduler/interval', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ interval_sec: sec }})
+      }});
+      const data = await res.json();
+      nextSyncSeconds = data.scheduler.next_sync_in_sec || sec;
+      const sel = document.getElementById('setting-interval');
+      if (sel) sel.value = val;
+    }}
+
     async function toggleAutoUnlike() {{
       const res = await fetch('/api/settings/auto-unlike/toggle', {{ method: 'POST' }});
       const data = await res.json();
-      const btn = document.getElementById('btn-auto-unlike-icon');
-      if (data.auto_unlike) btn.classList.add('active');
-      else btn.classList.remove('active');
+      const statusEl = document.getElementById('setting-auto-unlike-status');
+      if (statusEl) statusEl.innerText = data.auto_unlike ? 'ON' : 'OFF';
+      const btn = document.getElementById('setting-auto-unlike-btn');
+      if (btn) {{
+        if (data.auto_unlike) btn.classList.add('active');
+        else btn.classList.remove('active');
+      }}
     }}
 
     async function startBulkUnlike() {{
@@ -1437,6 +1587,12 @@ async def index():
 
     window.addEventListener('DOMContentLoaded', () => {{
       applyLayout();
+      renderTagCloud();
+      const savedTagLimit = localStorage.getItem('hud_top_tags_limit') || '10';
+      const tagLimitSelect = document.getElementById('setting-top-tags-count');
+      if (tagLimitSelect) tagLimitSelect.value = savedTagLimit;
+      const feedModeSelect = document.getElementById('setting-layout-mode');
+      if (feedModeSelect) feedModeSelect.value = displayMode;
       loadLikes(false);
       setTimeout(prefetchTopTags, 500);
     }});
