@@ -1,8 +1,9 @@
 import os
+import json
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 import lancedb
-import lancedb.index
 import pyarrow as pa
 
 SCHEMA = pa.schema([
@@ -30,6 +31,10 @@ class LanceDBStore:
         self.db_path.mkdir(parents=True, exist_ok=True)
         self.db = lancedb.connect(str(self.db_path))
         self.table_name = "likes"
+        self._stats_cache: dict[str, int] | None = None
+        self._stats_time: float = 0.0
+        self._tags_cache: list[dict[str, Any]] | None = None
+        self._tags_time: float = 0.0
         self._ensure_table()
 
     def _ensure_table(self):
@@ -40,39 +45,46 @@ class LanceDBStore:
                 self.table_name, schema=SCHEMA, mode="create"
             )
 
+    def _invalidate_cache(self):
+        self._stats_cache = None
+        self._tags_cache = None
+
     def _ensure_fts_index(self):
         if len(self.table) > 0:
             try:
-                self.table.create_index(col_name="text", config=lancedb.index.FTS(), replace=True)
+                self.table.create_fts_index("text", replace=True)
             except Exception:
                 pass
 
-    def upsert_tweets(self, tweets: list[dict[str, Any]]) -> int:
+    def upsert_tweets(self, tweets: Sequence[dict[str, Any]]) -> int:
         if not tweets:
             return 0
-        cleaned: list[dict[str, Any]] = []
+        cleaned = []
         for t in tweets:
-            vector = t.get("vector")
-            if vector is None or len(vector) != 1024:
-                vector = [0.0] * 1024
+            vec = t.get("vector") or [0.0] * 1024
+            if len(vec) != 1024:
+                vec = [0.0] * 1024
             cleaned.append({
-                "id": str(t.get("id") or t.get("tweet_id")),
-                "tweet_id": str(t.get("tweet_id") or t.get("id")),
-                "author_name": str(t.get("author_name") or ""),
-                "author_handle": str(t.get("author_handle") or ""),
-                "text": str(t.get("text") or ""),
-                "created_at": str(t.get("created_at") or ""),
-                "liked_at": str(t.get("liked_at") or ""),
-                "url": str(t.get("url") or ""),
-                "media_urls": list(t.get("media_urls") or []),
-                "local_media_paths": list(t.get("local_media_paths") or []),
-                "tags": list(t.get("tags") or []),
-                "vector": [float(v) for v in vector],
-                "raw_json": str(t.get("raw_json") or "{}"),
+                "id": str(t.get("id") or t.get("tweet_id", "")),
+                "tweet_id": str(t.get("tweet_id") or t.get("id", "")),
+                "author_name": str(t.get("author_name", "")),
+                "author_handle": str(t.get("author_handle", "")),
+                "text": str(t.get("text", "")),
+                "created_at": str(t.get("created_at", "")),
+                "liked_at": str(t.get("liked_at", "")),
+                "url": str(t.get("url", "")),
+                "media_urls": list(t.get("media_urls", [])),
+                "local_media_paths": list(t.get("local_media_paths", [])),
+                "tags": list(t.get("tags", [])),
+                "vector": vec,
+                "raw_json": str(t.get("raw_json", "")),
             })
-        self.table.merge_insert("id").when_matched_update_all().when_not_matched_insert_all().execute(cleaned)
-        self._ensure_fts_index()
+        self.table.merge_insert("tweet_id").when_matched_update_all().when_not_matched_insert_all().execute(cleaned)
+        self._invalidate_cache()
         return len(cleaned)
+
+    def get_all_tweets(self, limit: int = 1000) -> list[dict[str, Any]]:
+        return self.table.search().limit(limit).to_list()
 
     def search_hybrid(
         self,
@@ -83,38 +95,23 @@ class LanceDBStore:
         offset: int = 0,
         limit: int = 24,
     ) -> list[dict[str, Any]]:
-        if len(self.table) == 0:
-            return []
+        where_expr = f"array_contains(tags, '{tag}')" if tag else None
 
-        where_clauses: list[str] = []
-        if tag:
-            escaped_tag = tag.replace("'", "''")
-            where_clauses.append(f"array_has(tags, '{escaped_tag}')")
-        if sort_by == "media_only":
-            where_clauses.append("length(media_urls) > 0")
-
-        where_expr = " AND ".join(where_clauses) if where_clauses else None
-
-        # Vector search (Explicit Semantic Mode)
-        if query_vector and len(query_vector) == 1024 and any(v != 0.0 for v in query_vector):
+        if query_vector and any(v != 0.0 for v in query_vector):
             q = self.table.search(query_vector)
             if where_expr:
                 q = q.where(where_expr)
             return q.offset(offset).limit(limit).to_list()
 
-        # Ultra-Fast Full-Text Search (Sub-5ms FTS)
-        if query:
+        if query and not where_expr:
             try:
                 q = self.table.search(query, query_type="fts")
-                if where_expr:
-                    q = q.where(where_expr)
                 results = q.offset(offset).limit(limit).to_list()
                 if results:
                     return results
             except Exception:
                 pass
 
-        # Pushdown fast Tag / Scan query directly to LanceDB
         q = self.table.search()
         if where_expr:
             q = q.where(where_expr)
@@ -131,12 +128,18 @@ class LanceDBStore:
             items.sort(key=lambda x: x.get("created_at") or x.get("id") or "")
         elif sort_by == "author":
             items.sort(key=lambda x: (x.get("author_handle") or "").lower())
-        else: # newest
+        elif sort_by == "media_only":
+            items = [t for t in items if t.get("media_urls") or t.get("local_media_paths")]
+        else:
             items.reverse()
 
         return items[offset : offset + limit]
 
-    def get_stats(self) -> dict[str, int]:
+    def get_stats(self, force: bool = False) -> dict[str, int]:
+        now = time.time()
+        if not force and self._stats_cache and (now - self._stats_time < 30.0):
+            return self._stats_cache
+
         total = len(self.table) if hasattr(self, "table") else 0
         tag_set: set[str] = set()
         media_count = 0
@@ -158,14 +161,21 @@ class LanceDBStore:
                         vectors_count += 1
             except Exception:
                 pass
-        return {
+        res = {
             "total_likes": total,
             "indexed_vectors": vectors_count,
             "archived_media_files": media_count,
             "tags_count": len(tag_set),
         }
+        self._stats_cache = res
+        self._stats_time = now
+        return res
 
-    def get_all_tags(self) -> list[dict[str, Any]]:
+    def get_all_tags(self, force: bool = False) -> list[dict[str, Any]]:
+        now = time.time()
+        if not force and self._tags_cache and (now - self._tags_time < 30.0):
+            return self._tags_cache
+
         if len(self.table) == 0:
             return []
         table_arrow = self.table.to_arrow()
@@ -176,9 +186,7 @@ class LanceDBStore:
                 for t in tags:
                     if t:
                         counts[t] = counts.get(t, 0) + 1
-        return [{"tag": k, "count": v} for k, v in sorted(counts.items(), key=lambda x: -x[1])]
-
-    def get_all_tweets(self, limit: int = 1000) -> list[dict[str, Any]]:
-        if len(self.table) == 0:
-            return []
-        return self.table.search().limit(limit).to_list()
+        res = [{"tag": k, "count": v} for k, v in sorted(counts.items(), key=lambda x: -x[1])]
+        self._tags_cache = res
+        self._tags_time = now
+        return res

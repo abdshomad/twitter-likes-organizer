@@ -432,8 +432,54 @@ async def index():
     .toast-progress {{ background: #131926; height: 6px; border-radius: 3px; overflow: hidden; margin-top: 0.5rem; }}
     .toast-progress-fill {{ background: linear-gradient(90deg, var(--primary), var(--success)); height: 100%; width: 0%; transition: width 0.3s ease; }}
     .toast-log {{ font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: var(--muted); max-height: 90px; overflow-y: auto; margin-top: 0.5rem; }}
-    .hud-btn {{ background: rgba(255, 255, 255, 0.06); color: var(--text); border: 1px solid var(--card-border); padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; font-size: 0.8rem; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; transition: all 0.2s ease; }}
+    .hud-btn {{ background: rgba(255, 255, 255, 0.06); color: var(--text); border: 1px solid var(--card-border); padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; font-size: 0.8rem; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; transition: all 0.2s ease; min-height: 38px; }}
     .hud-btn:hover {{ background: rgba(255, 255, 255, 0.12); border-color: rgba(255, 255, 255, 0.25); }}
+    .mobile-drag-handle {{ width: 40px; height: 5px; background: rgba(255, 255, 255, 0.25); border-radius: 3px; margin: 8px auto 4px; display: none; }}
+
+    /* Responsive Mobile Overrides */
+    @media (max-width: 768px) {{
+      body {{ padding-top: 70px; }}
+      .container {{ padding: 0 0.5rem 2rem; }}
+      .hud-topbar {{ left: 8px; right: 8px; top: 8px; height: 52px; padding: 0 8px; }}
+      .hud-brand span {{ display: none; }}
+      .hud-ticker {{ display: none; }}
+      .desktop-only {{ display: none !important; }}
+      .mobile-drag-handle {{ display: block; }}
+      
+      .hud-deck {{ gap: 4px; }}
+      .hud-icon-btn {{ width: 38px; height: 38px; }}
+      
+      .hud-tag-cloud {{ display: flex; flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch; padding-bottom: 6px; scrollbar-width: none; }}
+      .hud-tag-cloud::-webkit-scrollbar {{ display: none; }}
+      .hud-tag {{ white-space: nowrap; flex-shrink: 0; padding: 0.4rem 0.75rem; font-size: 0.8rem; }}
+      .active-author-pill {{ flex-shrink: 0; white-space: nowrap; padding: 0.4rem 0.75rem; font-size: 0.8rem; }}
+
+      /* Mobile Full-Width Bottom Sheet Drawers */
+      .hud-chat-drawer, .hud-sidesheet {{
+        top: auto !important;
+        left: 0 !important;
+        right: 0 !important;
+        bottom: 0 !important;
+        width: 100% !important;
+        height: 85vh !important;
+        max-height: 85vh !important;
+        border-radius: 20px 20px 0 0 !important;
+        border-bottom: none !important;
+        transform: translateY(105%) !important;
+        box-shadow: 0 -10px 40px rgba(0, 0, 0, 0.85) !important;
+      }}
+      .hud-chat-drawer.open, .hud-sidesheet.open {{
+        transform: translateY(0) !important;
+      }}
+
+      /* Mobile Modal */
+      .hud-modal-backdrop {{ padding: 0; align-items: flex-end; }}
+      .hud-modal-box {{ max-height: 90vh; border-radius: 20px 20px 0 0; width: 100%; border-bottom: none; }}
+      .hud-modal-actions {{ flex-direction: column; }}
+      .hud-modal-actions .hud-btn {{ width: 100%; justify-content: center; }}
+      
+      .hud-floating-toast {{ left: 1rem; right: 1rem; width: auto; bottom: 1rem; }}
+    }}
   </style>
 </head>
 <body>
@@ -473,7 +519,7 @@ async def index():
       </button>
 
       <!-- Sync Interval Selector -->
-      <select id="select-interval" class="sync-select" onchange="changeSyncInterval(this.value)" title="Sync Cycle Interval">
+      <select id="select-interval" class="sync-select desktop-only" onchange="changeSyncInterval(this.value)" title="Sync Cycle Interval">
         <option value="300" {'selected' if sched['interval_sec'] == 300 else ''}>5m</option>
         <option value="600" {'selected' if sched['interval_sec'] == 600 else ''}>10m</option>
         <option value="1800" {'selected' if sched['interval_sec'] == 1800 else ''}>30m</option>
@@ -482,7 +528,7 @@ async def index():
       </select>
 
       <!-- Auto-Unlike Toggle Icon Button -->
-      <button id="btn-auto-unlike-icon" class="hud-icon-btn {'active' if sched.get('auto_unlike') else ''}" onclick="toggleAutoUnlike()" title="Toggle Auto-Unlike on X ({'ON' if sched.get('auto_unlike') else 'OFF'})">
+      <button id="btn-auto-unlike-icon" class="hud-icon-btn desktop-only {'active' if sched.get('auto_unlike') else ''}" onclick="toggleAutoUnlike()" title="Toggle Auto-Unlike on X ({'ON' if sched.get('auto_unlike') else 'OFF'})">
         <svg viewBox="0 0 24 24"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/><path d="m12 5-1 4 2 3-2 4"/></svg>
       </button>
 
@@ -498,13 +544,13 @@ async def index():
       </button>
 
       <!-- Import Archive Icon Button -->
-      <button class="hud-icon-btn" onclick="document.getElementById('file-upload').click()" title="Import Twitter like.js Archive">
+      <button class="hud-icon-btn desktop-only" onclick="document.getElementById('file-upload').click()" title="Import Twitter like.js Archive">
         <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
       </button>
       <input type="file" id="file-upload" style="display:none" onchange="uploadArchive(this)">
 
       <!-- Export Markdown Icon Button -->
-      <button class="hud-icon-btn" onclick="exportMarkdown()" title="Export All Tweets to Markdown Files">
+      <button class="hud-icon-btn desktop-only" onclick="exportMarkdown()" title="Export All Tweets to Markdown Files">
         <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
       </button>
 
@@ -588,6 +634,7 @@ async def index():
   <!-- Fullscreen Glassmorphic Tweet Detail Lightbox Modal -->
   <div id="hud-tweet-modal" class="hud-modal-backdrop" onclick="if(event.target===this) closeTweetModal()">
     <div class="hud-modal-box">
+      <div class="mobile-drag-handle"></div>
       <div class="hud-modal-header">
         <div style="display:flex; align-items:center; gap:8px;">
           <span style="font-size:1.1rem;">𝕏</span>
@@ -613,6 +660,7 @@ async def index():
 
   <!-- HUD RAG Chat Drawer -->
   <aside class="hud-chat-drawer" id="hud-chat-drawer">
+    <div class="mobile-drag-handle"></div>
     <div class="hud-sidesheet-header">
       <div style="display:flex; align-items:center; gap:8px;">
         <span style="font-size:1.1rem;">💬</span>
@@ -644,6 +692,7 @@ async def index():
 
   <!-- HUD Right Sidesheet -->
   <aside class="hud-sidesheet" id="hud-sidesheet">
+    <div class="mobile-drag-handle"></div>
     <div class="hud-sidesheet-header">
       <h3 style="font-size:0.95rem; font-weight:700;">HUD Telemetry & Controls</h3>
       <button class="hud-icon-btn" onclick="toggleSidesheet()" style="width:28px; height:28px;">✕</button>
@@ -1229,12 +1278,25 @@ async def index():
       }};
     }}
 
+    let cachedLogs = null;
+    let cachedNotifs = null;
+
+    function renderSidesheetSkeleton() {{
+      return `
+        <div style="display:flex; flex-direction:column; gap:8px;">
+          <div class="skeleton" style="height:50px; width:100%;"></div>
+          <div class="skeleton" style="height:50px; width:100%;"></div>
+          <div class="skeleton" style="height:50px; width:100%;"></div>
+        </div>
+      `;
+    }}
+
     function toggleSidesheet() {{
       const sheet = document.getElementById('hud-sidesheet');
       sheet.classList.toggle('open');
       if (sheet.classList.contains('open')) {{
-        loadHistoryLogs();
-        loadNotifications();
+        const activeTab = document.querySelector('.hud-tab.active')?.id.replace('tab-btn-', '') || 'logs';
+        switchHistTab(activeTab);
       }}
     }}
 
@@ -1249,52 +1311,67 @@ async def index():
         document.getElementById('tab-' + tab).style.display = tab === t ? 'block' : 'none';
         document.getElementById('tab-btn-' + tab).className = 'hud-tab ' + (tab === t ? 'active' : '');
       }});
+      if (t === 'logs' && !cachedLogs) loadHistoryLogs();
+      if (t === 'notifs' && !cachedNotifs) loadNotifications();
     }}
 
     async function loadHistoryLogs() {{
-      const res = await fetch('/api/history/logs?limit=30');
-      const data = await res.json();
       const container = document.getElementById('logs-container');
-      if (!data.logs || data.logs.length === 0) {{
-        container.innerHTML = '<p style="color:var(--muted); text-align:center; padding:1rem;">No sync logs recorded yet.</p>';
-        return;
+      if (!cachedLogs) container.innerHTML = renderSidesheetSkeleton();
+      try {{
+        const res = await fetch('/api/history/logs?limit=30');
+        const data = await res.json();
+        cachedLogs = data.logs || [];
+        if (cachedLogs.length === 0) {{
+          container.innerHTML = '<p style="color:var(--muted); text-align:center; padding:1rem;">No sync logs recorded yet.</p>';
+          return;
+        }}
+        container.innerHTML = cachedLogs.map(l => `
+          <div style="background:rgba(0,0,0,0.3); border:1px solid var(--card-border); padding:0.65rem; border-radius:6px; margin-bottom:0.5rem;">
+            <div style="display:flex; justify-content:space-between; font-size:0.75rem; color:var(--muted); margin-bottom:4px;">
+              <span><strong>${{l.trigger}}</strong> (${{l.engine}})</span>
+              <span style="font-family:'JetBrains Mono',monospace;">${{(l.timestamp||'').split(' ')[1] || l.timestamp}}</span>
+            </div>
+            <p style="font-size:0.8rem; line-height:1.3;">${{l.message}}</p>
+            <div style="display:flex; justify-content:space-between; font-size:0.7rem; color:var(--muted); margin-top:4px;">
+              <span>+${{l.new_likes}} likes (Total: ${{l.total_db_likes}})</span>
+              <span>${{l.duration_sec}}s</span>
+            </div>
+          </div>
+        `).join('');
+      }} catch (e) {{
+        container.innerHTML = '<p style="color:#ef4444; font-size:0.75rem;">Failed to load logs.</p>';
       }}
-      container.innerHTML = data.logs.map(l => `
-        <div style="background:rgba(0,0,0,0.3); border:1px solid var(--card-border); padding:0.65rem; border-radius:6px; margin-bottom:0.5rem;">
-          <div style="display:flex; justify-content:space-between; font-size:0.75rem; color:var(--muted); margin-bottom:4px;">
-            <span><strong>${{l.trigger}}</strong> (${{l.engine}})</span>
-            <span style="font-family:'JetBrains Mono',monospace;">${{l.timestamp.split(' ')[1]}}</span>
-          </div>
-          <p style="font-size:0.8rem; line-height:1.3;">${{l.message}}</p>
-          <div style="display:flex; justify-content:space-between; font-size:0.7rem; color:var(--muted); margin-top:4px;">
-            <span>+${{l.new_likes}} likes (Total: ${{l.total_db_likes}})</span>
-            <span>${{l.duration_sec}}s</span>
-          </div>
-        </div>
-      `).join('');
     }}
 
     async function loadNotifications() {{
-      const res = await fetch('/api/history/notifications?limit=30');
-      const data = await res.json();
       const container = document.getElementById('notifs-container');
-      if (!data.notifications || data.notifications.length === 0) {{
-        container.innerHTML = '<p style="color:var(--muted); text-align:center; padding:1rem;">No notifications.</p>';
-        return;
-      }}
-      container.innerHTML = data.notifications.map(n => `
-        <div style="background:rgba(0,0,0,0.3); border-left:3px solid ${{n.type === 'error' ? '#ef4444' : (n.type === 'success' ? '#10b981' : '#1d9bf0')}}; border:1px solid var(--card-border); padding:0.65rem; border-radius:6px; margin-bottom:0.5rem;">
-          <div style="display:flex; justify-content:space-between; font-size:0.75rem; color:var(--muted); margin-bottom:4px;">
-            <strong>${{n.title}}</strong><span style="font-family:'JetBrains Mono',monospace;">${{n.timestamp}}</span>
+      if (!cachedNotifs) container.innerHTML = renderSidesheetSkeleton();
+      try {{
+        const res = await fetch('/api/history/notifications?limit=30');
+        const data = await res.json();
+        cachedNotifs = data.notifications || [];
+        if (cachedNotifs.length === 0) {{
+          container.innerHTML = '<p style="color:var(--muted); text-align:center; padding:1rem;">No notifications.</p>';
+          return;
+        }}
+        container.innerHTML = cachedNotifs.map(n => `
+          <div style="background:rgba(0,0,0,0.3); border-left:3px solid ${{n.type === 'error' ? '#ef4444' : (n.type === 'success' ? '#10b981' : '#1d9bf0')}}; border:1px solid var(--card-border); padding:0.65rem; border-radius:6px; margin-bottom:0.5rem;">
+            <div style="display:flex; justify-content:space-between; font-size:0.75rem; color:var(--muted); margin-bottom:4px;">
+              <strong>${{n.title}}</strong><span style="font-family:'JetBrains Mono',monospace;">${{n.timestamp}}</span>
+            </div>
+            <p style="font-size:0.8rem;">${{n.message}}</p>
           </div>
-          <p style="font-size:0.8rem;">${{n.message}}</p>
-        </div>
-      `).join('');
+        `).join('');
+      }} catch (e) {{
+        container.innerHTML = '<p style="color:#ef4444; font-size:0.75rem;">Failed to load notifications.</p>';
+      }}
     }}
 
     async function markAllNotifsRead() {{
       await fetch('/api/history/notifications/read-all', {{ method: 'POST' }});
       document.getElementById('unread-badge').innerText = '';
+      cachedNotifs = null;
       loadNotifications();
     }}
 

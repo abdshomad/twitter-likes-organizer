@@ -15,15 +15,20 @@ class VectorEmbedder:
             self._model = TextEmbedding(model_name=self.model_name)
         return self._model
 
+    def _pad_or_truncate(self, vec: list[float], target_dim: int = 1024) -> list[float]:
+        if len(vec) < target_dim:
+            return vec + [0.0] * (target_dim - len(vec))
+        return vec[:target_dim]
+
     def embed_text(self, text: str) -> list[float]:
         if not text.strip():
-            return [0.0] * 384
+            return [0.0] * 1024
         embeddings = list(self.model.embed([text]))
-        return embeddings[0].tolist()
+        return self._pad_or_truncate(embeddings[0].tolist(), 1024)
 
     def embed_batch(self, texts: Sequence[str]) -> list[list[float]]:
         if not texts:
             return []
         cleaned = [t if t.strip() else "empty" for t in texts]
         embeddings = list(self.model.embed(cleaned))
-        return [emb.tolist() for emb in embeddings]
+        return [self._pad_or_truncate(emb.tolist(), 1024) for emb in embeddings]
