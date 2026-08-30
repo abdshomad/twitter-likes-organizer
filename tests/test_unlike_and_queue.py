@@ -11,16 +11,13 @@ async def test_media_queue_enqueue_and_process(tmp_path):
     queue_file = tmp_path / "media_queue.json"
     mq = MediaQueue(queue_path=queue_file)
 
-    # 1. Enqueue media items
     added = await mq.enqueue("12345", ["https://example.com/img1.jpg", "https://example.com/img2.jpg"])
     assert added == 2
     assert mq.get_status()["pending_count"] == 2
 
-    # Duplicate enqueue ignored
     added_dup = await mq.enqueue("12345", ["https://example.com/img1.jpg"])
     assert added_dup == 0
 
-    # 2. Persistence recovery across instance re-instantiation
     mq2 = MediaQueue(queue_path=queue_file)
     assert mq2.get_status()["pending_count"] == 2
 
@@ -39,4 +36,4 @@ async def test_unliker_headers_and_payload(tmp_path):
     assert "authorization" in headers
     assert "auth_token=test_token" in headers["cookie"]
     assert headers["x-csrf-token"] == "test_ct0"
-    assert headers["content-type"] == "application/x-www-form-urlencoded"
+    assert headers["content-type"] == "application/json"

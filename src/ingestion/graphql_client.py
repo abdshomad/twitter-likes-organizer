@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Callable, Awaitable
 from curl_cffi.requests import AsyncSession
@@ -7,13 +8,15 @@ from curl_cffi.requests import AsyncSession
 DEFAULT_DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULT_SESSION_PATH = DEFAULT_DATA_DIR / "session.json"
 BEARER_TOKEN = "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
-LIKES_QUERY_ID = "nkWXnZ7yXjVf_rL-D8kLFA"
-USER_BY_SCREEN_NAME_QUERY_ID = "G3KGOASz96M-Qu0nwmGXNg"
+LIKES_QUERY_ID = "xA8fDIbrJfy4ojjjXmSR-A"
+USER_BY_SCREEN_NAME_QUERY_ID = "Gb-d6r0vxPOADdG62OEBpQ"
 
 
 class TwitterGraphQLClient:
     def __init__(self, session_path: Path | str | None = None):
         self.session_path = Path(session_path or DEFAULT_SESSION_PATH)
+        self.likes_query_id = LIKES_QUERY_ID
+        self.user_query_id = USER_BY_SCREEN_NAME_QUERY_ID
 
     def _get_auth_headers(self) -> dict[str, str]:
         if not self.session_path.exists():
@@ -43,7 +46,7 @@ class TwitterGraphQLClient:
 
     async def get_user_id(self, screen_name: str) -> str:
         headers = self._get_auth_headers()
-        url = f"https://x.com/i/api/graphql/{USER_BY_SCREEN_NAME_QUERY_ID}/UserByScreenName"
+        url = f"https://x.com/i/api/graphql/{self.user_query_id}/UserByScreenName"
         params = {
             "variables": json.dumps({"screen_name": screen_name.replace("@", ""), "withSafetyModeUserFields": True}),
             "features": json.dumps({"hidden_profile_likes_enabled": True, "responsive_web_graphql_exclude_directive_enabled": True}),
@@ -60,7 +63,7 @@ class TwitterGraphQLClient:
 
     async def fetch_likes_page(self, user_id: str, cursor: str = "", count: int = 100) -> tuple[list[dict[str, Any]], str]:
         headers = self._get_auth_headers()
-        url = f"https://x.com/i/api/graphql/{LIKES_QUERY_ID}/Likes"
+        url = f"https://x.com/i/api/graphql/{self.likes_query_id}/Likes"
         variables = {"userId": user_id, "count": count, "includePromotedContent": False, "withVoice": False}
         if cursor:
             variables["cursor"] = cursor
@@ -84,6 +87,8 @@ class TwitterGraphQLClient:
         next_cursor = ""
         try:
             instructions = data.get("data", {}).get("user", {}).get("result", {}).get("timeline_v2", {}).get("timeline", {}).get("instructions", [])
+            if not instructions:
+                instructions = data.get("data", {}).get("user", {}).get("result", {}).get("timeline", {}).get("timeline", {}).get("instructions", [])
             for inst in instructions:
                 if inst.get("type") != "TimelineAddEntries":
                     continue

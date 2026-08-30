@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import random
+import re
 from pathlib import Path
 from typing import Any, Callable, Awaitable
 from curl_cffi.requests import AsyncSession
@@ -9,16 +10,13 @@ from curl_cffi.requests import AsyncSession
 DEFAULT_DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULT_SESSION_PATH = DEFAULT_DATA_DIR / "session.json"
 BEARER_TOKEN = "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
-UNLIKE_ENDPOINTS = [
-    "https://x.com/i/api/1.1/favorites/destroy.json",
-    "https://api.x.com/1.1/favorites/destroy.json",
-    "https://twitter.com/i/api/1.1/favorites/destroy.json",
-]
+DEFAULT_UNFAVORITE_QUERY_ID = "ZYKSe-w7KEslx3JhSIk5LA"
 
 
 class TwitterUnliker:
     def __init__(self, session_path: Path | str | None = None):
         self.session_path = Path(session_path or DEFAULT_SESSION_PATH)
+        self.unfavorite_query_id = DEFAULT_UNFAVORITE_QUERY_ID
 
     def _get_auth_headers(self) -> dict[str, str]:
         if not self.session_path.exists():
@@ -41,36 +39,54 @@ class TwitterUnliker:
             "referer": "https://x.com/",
             "origin": "https://x.com",
             "accept": "*/*",
-            "content-type": "application/x-www-form-urlencoded",
+            "content-type": "application/json",
         }
         if ct0:
             headers["x-csrf-token"] = ct0
         return headers
 
-    async def unlike_tweet_api(self, tweet_id: str) -> tuple[bool, int]:
+    async def auto_refresh_query_id(self) -> str:
+        try:
+            async with AsyncSession(impersonate="chrome120") as s:
+                r = await s.get("https://x.com")
+                scripts = re.findall(r'https://abs\.twimg\.com/responsive-web/client-web/[a-zA-Z0-9_\-\.]+\.js', r.text)
+                for sc in scripts:
+                    sr = await s.get(sc)
+                    matches = re.findall(r'queryId:\"([a-zA-Z0-9_\-]+)\",operationName:\"UnfavoriteTweet\"', sr.text)
+                    if matches:
+                        self.unfavorite_query_id = matches[0]
+                        return self.unfavorite_query_id
+        except Exception:
+            pass
+        return self.unfavorite_query_id
+
+    async def unlike_tweet_graphql(self, tweet_id: str) -> tuple[bool, int]:
         headers = self._get_auth_headers()
-        payload = {"id": str(tweet_id)}
+        url = f"https://x.com/i/api/graphql/{self.unfavorite_query_id}/UnfavoriteTweet"
+        payload = {"variables": {"tweet_id": str(tweet_id)}, "queryId": self.unfavorite_query_id}
+        
         async with AsyncSession(impersonate="chrome120") as s:
-            for url in UNLIKE_ENDPOINTS:
-                try:
-                    r = await s.post(url, headers=headers, data=payload, timeout=12)
-                    if r.status_code == 200:
-                        return True, 200
-                    if r.status_code == 404:
-                        # 404 on destroy means already unliked or deleted -> considered success
-                        return True, 404
-                    if r.status_code == 429:
-                        return False, 429
-                except Exception:
-                    continue
-        return False, 500
+            r = await s.post(url, headers=headers, json=payload, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                res = data.get("data", {}).get("unfavorite_tweet")
+                return res == "Done" or bool(res), 200
+            if r.status_code == 404:
+                # Refresh query ID if rotated
+                await self.auto_refresh_query_id()
+                url = f"https://x.com/i/api/graphql/{self.unfavorite_query_id}/UnfavoriteTweet"
+                payload["queryId"] = self.unfavorite_query_id
+                r2 = await s.post(url, headers=headers, json=payload, timeout=15)
+                if r2.status_code == 200:
+                    return True, 200
+            return False, r.status_code
 
     async def ensure_unliked(self, tweet_id: str, tweet_url: str = "", max_attempts: int = 3) -> tuple[bool, str]:
         for attempt in range(1, max_attempts + 1):
             try:
-                success, status_code = await self.unlike_tweet_api(tweet_id)
+                success, status_code = await self.unlike_tweet_graphql(tweet_id)
                 if success:
-                    return True, "api"
+                    return True, "graphql"
                 if status_code == 429:
                     await asyncio.sleep(4.0)
             except Exception:
