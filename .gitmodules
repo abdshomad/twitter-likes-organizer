@@ -4,3 +4,6 @@
 [submodule "cordis"]
 	path = cordis
 	url = https://github.com/cordiverse/cordis.git
+[submodule "hud-design"]
+	path = hud-design
+	url = https://github.com/abdshomad/hud-design.git
