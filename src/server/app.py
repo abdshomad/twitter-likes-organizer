@@ -830,6 +830,31 @@ async def index():
       }}
     }}
 
+    function resolveMediaUrl(p) {{
+      if (!p) return '';
+      if (p.startsWith('http://') || p.startsWith('https://') || p.startsWith('data:')) return p;
+      let clean = p.replace(/^data\//, '').replace(/^\/+/, '');
+      if (!clean.startsWith('media/')) clean = 'media/' + clean;
+      return '/' + clean;
+    }}
+
+    function isVideoMedia(url) {{
+      if (!url) return false;
+      const lower = url.toLowerCase();
+      return lower.endsWith('.mp4') || lower.endsWith('.webm') || lower.endsWith('.mov') || lower.includes('/video/');
+    }}
+
+    function renderMediaElement(src, fallback, tweetId, isModal = false) {{
+      if (isVideoMedia(src)) {{
+        return isModal
+          ? `<video class="hud-modal-img" src="${{src}}" controls preload="metadata"></video>`
+          : `<video class="media-thumb" src="${{src}}" preload="metadata" muted playsinline onclick="event.stopPropagation(); openTweetModal('${{tweetId}}')"></video>`;
+      }}
+      return isModal
+        ? `<a href="${{src}}" target="_blank" title="View high-res in new tab"><img class="hud-modal-img" src="${{src}}" onerror="this.src='${{fallback}}'"></a>`
+        : `<img class="media-thumb" src="${{src}}" onerror="this.src='${{fallback}}'" onclick="event.stopPropagation(); openTweetModal('${{tweetId}}')" loading="lazy">`;
+    }}
+
     function renderResults(data, append) {{
       const container = document.getElementById('results');
       const results = data.results || [];
@@ -850,8 +875,8 @@ async def index():
 
       const html = results.map(r => {{
         const mediaList = (r.local_media_paths && r.local_media_paths.length)
-          ? r.local_media_paths.map(p => `/media/${{p.split('/').pop()}}`)
-          : (r.media_urls || []);
+          ? r.local_media_paths.map(resolveMediaUrl)
+          : (r.media_urls || []).map(resolveMediaUrl);
         const fallbackSrc = (r.media_urls && r.media_urls.length) ? r.media_urls[0] : '';
         const cleanHandle = (r.author_handle || '').replace(/^@+/, '');
         const authorDisplay = cleanHandle ? '@' + cleanHandle : 'Post #' + r.tweet_id;
@@ -871,7 +896,7 @@ async def index():
           const mediaSrc = mediaList.length ? mediaList[0] : '';
           return `
             <div class="gallery-card" onclick="openTweetModal('${{r.tweet_id}}')">
-              ${{mediaSrc ? `<img class="gallery-img" src="${{mediaSrc}}" onerror="this.src='${{fallbackSrc}}'" loading="lazy">` : '<div style=\"height:120px; background:#131926; display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:0.8rem;\">Text Post</div>'}}
+              ${{mediaSrc ? (isVideoMedia(mediaSrc) ? `<video class="gallery-img" src="${{mediaSrc}}" preload="metadata" muted playsinline></video>` : `<img class="gallery-img" src="${{mediaSrc}}" onerror="this.src='${{fallbackSrc}}'" loading="lazy">`) : '<div style=\"height:120px; background:#131926; display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:0.8rem;\">Text Post</div>'}}
               <div class="gallery-body">
                 <div class="tweet-header">
                   <span class="author-interactive" onclick="event.stopPropagation(); filterAuthor('${{cleanHandle}}')"><strong>${{r.author_name || authorDisplay}}</strong></span>
@@ -896,7 +921,7 @@ async def index():
                 </a>
               </div>
               <div class="tweet-text">${{formattedText}}</div>
-              ${{mediaList.length ? `<div class="media-grid">${{mediaList.map(m => `<img class="media-thumb" src="${{m}}" onerror="this.src='${{fallbackSrc}}'" onclick="event.stopPropagation(); openTweetModal('${{r.tweet_id}}')" loading="lazy">`).join('')}}</div>` : ''}}
+              ${{mediaList.length ? `<div class="media-grid">${{mediaList.map(m => renderMediaElement(m, fallbackSrc, r.tweet_id, false)).join('')}}</div>` : ''}}
             </div>
             <div style="margin-top:0.75rem">${{(r.tags || []).map(t => `<span class="hud-tag" onclick="event.stopPropagation(); filterTag('${{t}}')">${{t}}</span>`).join(' ')}}</div>
           </div>
@@ -967,16 +992,12 @@ async def index():
 
       const mediaContainer = document.getElementById('modal-media-container');
       const mediaList = (tweet.local_media_paths && tweet.local_media_paths.length)
-        ? tweet.local_media_paths.map(p => `/media/${{p.split('/').pop()}}`)
-        : (tweet.media_urls || []);
+        ? tweet.local_media_paths.map(resolveMediaUrl)
+        : (tweet.media_urls || []).map(resolveMediaUrl);
       const fallbackSrc = (tweet.media_urls && tweet.media_urls.length) ? tweet.media_urls[0] : '';
       
       if (mediaList.length > 0) {{
-        mediaContainer.innerHTML = mediaList.map(m => `
-          <a href="${{m}}" target="_blank" title="Click to view full image in new tab">
-            <img class="hud-modal-img" src="${{m}}" onerror="this.src='${{fallbackSrc}}'">
-          </a>
-        `).join('');
+        mediaContainer.innerHTML = mediaList.map(m => renderMediaElement(m, fallbackSrc, tweet.tweet_id, true)).join('');
       }} else {{
         mediaContainer.innerHTML = '';
       }}
