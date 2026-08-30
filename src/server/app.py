@@ -66,6 +66,11 @@ app = FastAPI(title="𝕏 Likes Organizer HUD", version="0.2.0", lifespan=lifesp
 app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media")
 
 
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return HTMLResponse('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><text y="20" font-size="20">𝕏</text></svg>', media_type="image/svg+xml")
+
+
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "host": HOST, "port": PORT, "storage": str(DATA_DIR)}
@@ -718,10 +723,10 @@ async def index():
       escaped = escaped.replace(/(https?:\\/\\/[^\\s]+)/g, '<a href="$1" target="_blank" onclick="event.stopPropagation()">$1</a>');
       
       // Auto-hyperlink @mentions
-      escaped = escaped.replace(/@([a-zA-Z0-9_]+)/g, '<span class="tweet-mention" onclick="event.stopPropagation(); filterAuthor(\'$1\')">@$1</span>');
+      escaped = escaped.replace(/@([a-zA-Z0-9_]+)/g, '<span class="tweet-mention" data-author="$1" onclick="event.stopPropagation(); filterAuthor(this.dataset.author)">@$1</span>');
       
       // Auto-hyperlink #hashtags
-      escaped = escaped.replace(/#([a-zA-Z0-9_]+)/g, '<span class="tweet-hashtag" onclick="event.stopPropagation(); filterTag(\'$1\')">#$1</span>');
+      escaped = escaped.replace(/#([a-zA-Z0-9_]+)/g, '<span class="tweet-hashtag" data-tag="$1" onclick="event.stopPropagation(); filterTag(this.dataset.tag)">#$1</span>');
       
       return escaped;
     }}
