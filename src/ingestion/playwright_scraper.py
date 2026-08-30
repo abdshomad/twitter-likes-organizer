@@ -133,7 +133,8 @@ class PlaywrightXScraper:
                 await browser.close()
                 return {"status": "error", "message": f"Login failed: {str(e)}"}
 
-    async def scrape_likes(self, username: str = "", max_tweets: int = 50) -> list[dict[str, Any]]:
+    async def scrape_likes(self, username: str = "", max_tweets: int = 0) -> list[dict[str, Any]]:
+        """Scrapes likes timeline with uncapped infinite scrolling until 5 consecutive empty checks."""
         self._ensure_restored()
         target = self.session_path if self.session_path.exists() else self.backup_path
         if not target.exists():
@@ -157,31 +158,28 @@ class PlaywrightXScraper:
             )
             page = await context.new_page()
 
-            # Navigate with domcontentloaded to prevent networkidle timeouts
-            navigated = False
             for url in ["https://x.com/i/history/likes", f"https://x.com/{username}/likes" if username else None]:
                 if not url:
                     continue
                 try:
                     await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-                    await page.wait_for_timeout(2000)
+                    await page.wait_for_timeout(1500)
                     if "login" not in page.url:
-                        navigated = True
                         break
                 except Exception:
                     continue
 
-            if not navigated and username:
-                await page.goto(f"https://x.com/{username}/likes", wait_until="domcontentloaded", timeout=15000)
-
-            # Wait for tweet stream container
             try:
                 await page.wait_for_selector("article[data-testid='tweet']", timeout=10000)
             except Exception:
                 pass
 
-            scroll_attempts = 0
-            while len(extracted_tweets) < max_tweets and scroll_attempts < 20:
+            consecutive_empty = 0
+            last_height = 0
+
+            # Infinite scroll loop until 5 consecutive empty checks or max_tweets reached
+            while True:
+                initial_count = len(extracted_tweets)
                 articles = await page.locator("article[data-testid='tweet']").all()
                 for article in articles:
                     try:
@@ -223,14 +221,28 @@ class PlaywrightXScraper:
                             "tags": [],
                             "raw_json": json.dumps({"id": tweet_id, "text": tweet_text, "user": user_text}),
                         })
-                        if len(extracted_tweets) >= max_tweets:
+                        if max_tweets > 0 and len(extracted_tweets) >= max_tweets:
                             break
                     except Exception:
                         continue
 
-                await page.evaluate("window.scrollBy(0, window.innerHeight * 1.5);")
-                await page.wait_for_timeout(1200)
-                scroll_attempts += 1
+                if max_tweets > 0 and len(extracted_tweets) >= max_tweets:
+                    break
+
+                # Scroll down
+                current_height = await page.evaluate("document.body.scrollHeight")
+                await page.evaluate("window.scrollBy(0, window.innerHeight * 2);")
+                await page.wait_for_timeout(1000)
+
+                # Check if new tweets were added or page height increased
+                if len(extracted_tweets) == initial_count and current_height == last_height:
+                    consecutive_empty += 1
+                    if consecutive_empty >= 5:
+                        break
+                else:
+                    consecutive_empty = 0
+
+                last_height = current_height
 
             await browser.close()
         return extracted_tweets

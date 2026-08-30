@@ -85,10 +85,11 @@ class BackgroundSyncScheduler:
         inserted_count = 0
         try:
             # Query existing IDs to avoid re-visiting/re-processing
-            existing_tweets = self.store.get_all_tweets(limit=50000)
+            existing_tweets = self.store.get_all_tweets(limit=100000)
             existing_ids = {t["tweet_id"] for t in existing_tweets if t.get("tweet_id")}
 
-            scraped = await self.scraper.scrape_likes(max_tweets=100)
+            # Uncapped infinite scroll (max_tweets=0) until reaching the end of timeline
+            scraped = await self.scraper.scrape_likes(max_tweets=0)
             new_tweets = [t for t in scraped if t.get("id") not in existing_ids]
 
             for tweet in new_tweets:
