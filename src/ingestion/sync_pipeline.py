@@ -42,12 +42,10 @@ async def stream_likes_sync(
 
     async def on_item_found(tweet: dict):
         nonlocal processed_count
-        # 1. Enqueue media to async queue (Decoupled Stage 1)
         media_urls = tweet.get("media_urls", [])
         if media_urls:
             await media_queue.enqueue(tweet.get("id", ""), media_urls)
 
-        # 2. AI tagging & vector embedding
         tags = tagger.generate_tags(tweet["text"])
         tweet["tags"] = tags
         try:
@@ -55,17 +53,14 @@ async def stream_likes_sync(
         except Exception:
             tweet["vector"] = [0.0] * 1024
 
-        # 3. Store locally in LanceDB
         store.upsert_tweets([tweet])
         processed_count += 1
 
-        # 4. Optional Safe Auto-Unlike on X
         unliked = False
+        unlike_method = ""
+        # Synchronous unlike verification before continuing to next like
         if auto_unlike:
-            try:
-                unliked = await unliker.unlike_tweet(tweet.get("id", ""), tweet.get("url", ""))
-            except Exception:
-                pass
+            unliked, unlike_method = await unliker.ensure_unliked(tweet.get("id", ""), tweet.get("url", ""), max_attempts=3)
 
         await event_queue.put({
             "stage": "item_done",
@@ -77,6 +72,7 @@ async def stream_likes_sync(
             "tags": tags,
             "media_count": len(media_urls),
             "unliked": unliked,
+            "unlike_method": unlike_method,
         })
 
     async def run_sync():
@@ -123,7 +119,7 @@ async def stream_likes_sync(
             status="success",
             new_likes=processed_count,
             total_db_likes=total_db,
-            message=f"Synced {processed_count} likes (Decoupled Stage 1).",
+            message=f"Synced {processed_count} likes (Auto-Unlike Verified: {auto_unlike}).",
             duration_sec=duration,
         )
     except Exception as e:

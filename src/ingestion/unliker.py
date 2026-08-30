@@ -44,19 +44,16 @@ class TwitterUnliker:
             headers["x-csrf-token"] = ct0
         return headers
 
-    async def unlike_tweet_graphql(self, tweet_id: str) -> bool:
+    async def unlike_tweet_graphql(self, tweet_id: str) -> tuple[bool, int]:
         headers = self._get_auth_headers()
         url = f"https://x.com/i/api/graphql/{UNFAVORITE_QUERY_ID}/UnfavoriteTweet"
-        payload = {
-            "variables": {"tweet_id": tweet_id},
-            "queryId": UNFAVORITE_QUERY_ID,
-        }
+        payload = {"variables": {"tweet_id": tweet_id}, "queryId": UNFAVORITE_QUERY_ID}
         async with AsyncSession(impersonate="chrome120") as s:
             r = await s.post(url, headers=headers, json=payload, timeout=15)
             if r.status_code == 200:
                 data = r.json()
-                return bool(data.get("data", {}).get("unfavorite_tweet"))
-            return False
+                return bool(data.get("data", {}).get("unfavorite_tweet")), 200
+            return False, r.status_code
 
     async def unlike_tweet_playwright(self, tweet_url: str) -> bool:
         if not self.session_path.exists():
@@ -80,20 +77,33 @@ class TwitterUnliker:
                 await browser.close()
                 return False
 
-    async def unlike_tweet(self, tweet_id: str, tweet_url: str = "") -> bool:
-        try:
-            success = await self.unlike_tweet_graphql(tweet_id)
-            if success:
-                return True
-        except Exception:
-            pass
-
-        if tweet_url:
+    async def ensure_unliked(self, tweet_id: str, tweet_url: str = "", max_attempts: int = 3) -> tuple[bool, str]:
+        for attempt in range(1, max_attempts + 1):
             try:
-                return await self.unlike_tweet_playwright(tweet_url)
+                success, status_code = await self.unlike_tweet_graphql(tweet_id)
+                if success:
+                    return True, "graphql"
+                if status_code == 429:
+                    await asyncio.sleep(5.0)
             except Exception:
                 pass
-        return False
+
+            if tweet_url:
+                try:
+                    pw_success = await self.unlike_tweet_playwright(tweet_url)
+                    if pw_success:
+                        return True, "playwright"
+                except Exception:
+                    pass
+
+            if attempt < max_attempts:
+                await asyncio.sleep(1.0 * attempt)
+
+        return False, "failed"
+
+    async def unlike_tweet(self, tweet_id: str, tweet_url: str = "") -> bool:
+        success, _ = await self.ensure_unliked(tweet_id, tweet_url, max_attempts=2)
+        return success
 
     async def bulk_unlike(
         self,
@@ -109,7 +119,7 @@ class TwitterUnliker:
             if not tweet_id:
                 continue
 
-            success = await self.unlike_tweet(str(tweet_id), url)
+            success, _ = await self.ensure_unliked(str(tweet_id), url, max_attempts=3)
             if success:
                 unliked_count += 1
 
@@ -123,7 +133,6 @@ class TwitterUnliker:
                     "success": success,
                 })
 
-            # Humanized anti-ban pacing (800ms - 1500ms)
             delay = random.uniform(0.8, 1.5)
             await asyncio.sleep(delay)
 

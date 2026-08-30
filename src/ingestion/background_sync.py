@@ -123,9 +123,10 @@ class BackgroundSyncScheduler:
                 existing_ids.add(tweet.get("id"))
                 inserted_count += 1
 
+                # Synchronous verified unlike before moving to next
                 if self.auto_unlike:
                     try:
-                        await self.unliker.unlike_tweet(tweet.get("id", ""), tweet.get("url", ""))
+                        await self.unliker.ensure_unliked(tweet.get("id", ""), tweet.get("url", ""), max_attempts=3)
                     except Exception:
                         pass
 
@@ -148,7 +149,7 @@ class BackgroundSyncScheduler:
                 status="success",
                 new_likes=inserted_count,
                 total_db_likes=total_db,
-                message=f"Auto-sync completed (+{inserted_count} likes, media enqueued).",
+                message=f"Auto-sync completed (+{inserted_count} likes, Auto-Unlike: {self.auto_unlike}).",
                 duration_sec=duration,
             )
         except Exception as e:
