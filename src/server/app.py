@@ -117,6 +117,15 @@ async def get_media_queue_status():
     return media_queue.get_status()
 
 
+@app.post("/api/maintenance/unlike-single")
+async def maintenance_unlike_single(payload: dict[str, Any] = Body(...)):
+    tweet_id = payload.get("tweet_id", "")
+    if not tweet_id:
+        return JSONResponse({"status": "error", "message": "tweet_id is required"}, status_code=400)
+    success = await unliker.unlike_tweet(tweet_id)
+    return {"status": "success" if success else "failed", "tweet_id": tweet_id, "unliked": success}
+
+
 @app.post("/api/maintenance/unlike-synced")
 async def maintenance_unlike_synced(bg: BackgroundTasks):
     tweets = store.get_all_tweets(limit=10000)
@@ -184,6 +193,7 @@ async def chat_stream(q: str = Query(..., description="User chat query to LanceD
 async def search_likes(
     q: str = Query("", description="Search query"),
     tag: str | None = Query(None, description="Tag filter"),
+    author: str | None = Query(None, description="Author filter"),
     sort_by: str = Query("newest", description="Sort option"),
     semantic: bool = Query(False, description="Enable vector semantic search"),
     offset: int = Query(0, ge=0),
@@ -191,7 +201,19 @@ async def search_likes(
 ):
     t0 = time.perf_counter()
     vector = embedder.embed_text(q.strip()) if (semantic and q.strip()) else None
-    results = store.search_hybrid(query=q.strip(), query_vector=vector, tag=tag, sort_by=sort_by, offset=offset, limit=limit)
+    
+    # Pushdown author filter if present
+    query_text = q.strip()
+    if author:
+        author_clean = author.lstrip("@").strip()
+        if not query_text:
+            query_text = author_clean
+
+    results = store.search_hybrid(query=query_text, query_vector=vector, tag=tag, sort_by=sort_by, offset=offset, limit=limit)
+    if author:
+        author_clean = author.lstrip("@").lower()
+        results = [r for r in results if (r.get("author_handle") or "").lstrip("@").lower() == author_clean or author_clean in (r.get("author_name") or "").lower()]
+
     latency_ms = (time.perf_counter() - t0) * 1000.0
     return {
         "count": len(results),
@@ -227,7 +249,6 @@ async def export_markdown():
 @app.get("/", response_class=HTMLResponse)
 async def index():
     stats = store.get_stats()
-    q_stat = media_queue.get_status()
     tags = store.get_all_tags()[:30]
     tags_html = "".join([f"<span class='hud-tag' id='tag-{t['tag']}' onclick='filterTag(\"{t['tag']}\")'>{t['tag']} <span class='tag-count'>{t['count']}</span></span>" for t in tags])
     auth = scraper.get_session_status()
@@ -310,12 +331,13 @@ async def index():
     .icon-btn svg {{ width: 14px; height: 14px; fill: currentColor; stroke: currentColor; }}
     .icon-btn.active {{ background: rgba(29, 155, 240, 0.25); color: #60a5fa; border: 1px solid rgba(29, 155, 240, 0.4); }}
     
-    /* Tag Cloud */
+    /* Tag Cloud & Author Filter Active Pills */
     .hud-tag-cloud {{ display: flex; flex-wrap: wrap; gap: 0.45rem; }}
     .hud-tag {{ background: rgba(29, 155, 240, 0.1); color: #7dd3fc; border: 1px solid rgba(29, 155, 240, 0.25); padding: 0.25rem 0.6rem; border-radius: 999px; font-size: 0.75rem; cursor: pointer; transition: all 0.15s ease; }}
     .hud-tag:hover {{ background: rgba(29, 155, 240, 0.25); border-color: rgba(29, 155, 240, 0.5); }}
     .hud-tag.active {{ background: #0284c7; color: #fff; font-weight: bold; border-color: #38bdf8; box-shadow: 0 0 10px rgba(56, 189, 248, 0.4); }}
     .tag-count {{ font-size: 0.7rem; opacity: 0.7; font-family: 'JetBrains Mono', monospace; }}
+    .active-author-pill {{ background: rgba(99, 102, 241, 0.25); color: #c7d2fe; border: 1px solid #6366f1; padding: 0.25rem 0.65rem; border-radius: 999px; font-size: 0.75rem; font-family: 'JetBrains Mono', monospace; cursor: pointer; display: inline-flex; align-items: center; gap: 5px; }}
 
     /* Multi-Column Layout Grid */
     #results.cols-1 {{ display: grid; grid-template-columns: 1fr; max-width: 820px; margin: 0 auto; gap: 1rem; }}
@@ -326,19 +348,50 @@ async def index():
     @media (max-width: 850px) {{ #results.cols-3, #results.cols-4 {{ grid-template-columns: repeat(2, 1fr); }} }}
     @media (max-width: 600px) {{ #results.cols-2, #results.cols-3, #results.cols-4 {{ grid-template-columns: 1fr; }} }}
 
-    /* HUD Tweet Cards */
-    .hud-tweet-card {{ background: var(--card-bg); backdrop-filter: blur(8px); border: 1px solid var(--card-border); padding: 1.25rem; border-radius: 12px; display: flex; flex-direction: column; justify-content: space-between; transition: all 0.2s ease; }}
-    .hud-tweet-card:hover {{ border-color: rgba(29, 155, 240, 0.4); transform: translateY(-2px); box-shadow: 0 8px 20px rgba(0,0,0,0.5); }}
-    .tweet-header {{ display: flex; justify-content: space-between; color: var(--muted); font-size: 0.85rem; margin-bottom: 0.6rem; }}
+    /* HUD Tweet Cards - Fully Clickable Surface */
+    .hud-tweet-card {{ background: var(--card-bg); backdrop-filter: blur(8px); border: 1px solid var(--card-border); padding: 1.25rem; border-radius: 12px; display: flex; flex-direction: column; justify-content: space-between; transition: all 0.2s ease; cursor: pointer; position: relative; }}
+    .hud-tweet-card:hover {{ border-color: rgba(29, 155, 240, 0.5); transform: translateY(-2px); box-shadow: 0 8px 25px rgba(0,0,0,0.6); }}
+    .tweet-header {{ display: flex; justify-content: space-between; align-items: center; color: var(--muted); font-size: 0.85rem; margin-bottom: 0.6rem; }}
+    .author-interactive {{ color: var(--text); font-weight: 700; transition: color 0.15s; display: inline-flex; align-items: center; gap: 4px; }}
+    .author-interactive:hover {{ color: var(--primary); text-decoration: underline; }}
+    .handle-badge {{ font-family: 'JetBrains Mono', monospace; color: var(--muted); font-size: 0.8rem; margin-left: 4px; }}
+    .handle-badge:hover {{ color: #38bdf8; text-decoration: underline; }}
+    .ext-link-icon {{ color: var(--muted); opacity: 0.6; padding: 2px 4px; border-radius: 4px; display: inline-flex; align-items: center; }}
+    .ext-link-icon:hover {{ opacity: 1; color: var(--primary); background: rgba(29, 155, 240, 0.15); }}
+    
+    /* In-Text Clickable Elements */
+    .tweet-text {{ white-space: pre-wrap; line-height: 1.45; font-size: 0.9rem; word-break: break-word; }}
+    .tweet-text a {{ color: var(--primary); text-decoration: none; word-break: break-all; }}
+    .tweet-text a:hover {{ text-decoration: underline; }}
+    .tweet-mention {{ color: #38bdf8; cursor: pointer; font-weight: 500; font-family: 'JetBrains Mono', monospace; }}
+    .tweet-mention:hover {{ text-decoration: underline; }}
+    .tweet-hashtag {{ color: #a5b4fc; cursor: pointer; font-weight: 500; }}
+    .tweet-hashtag:hover {{ text-decoration: underline; }}
+
+    /* Media Grid & Lightbox Trigger */
     .media-grid {{ display: flex; gap: 0.5rem; margin-top: 0.75rem; overflow-x: auto; }}
-    .media-thumb {{ max-height: 180px; border-radius: 8px; object-fit: cover; border: 1px solid var(--card-border); }}
+    .media-thumb {{ max-height: 180px; border-radius: 8px; object-fit: cover; border: 1px solid var(--card-border); cursor: zoom-in; transition: transform 0.2s; }}
+    .media-thumb:hover {{ transform: scale(1.02); border-color: rgba(29, 155, 240, 0.5); }}
     
     /* Compact Row & Gallery Styles */
-    .compact-row {{ display: flex; justify-content: space-between; align-items: center; background: var(--card-bg); border: 1px solid var(--card-border); padding: 0.75rem 1rem; border-radius: 8px; gap: 1rem; font-size: 0.85rem; }}
+    .compact-row {{ display: flex; justify-content: space-between; align-items: center; background: var(--card-bg); border: 1px solid var(--card-border); padding: 0.75rem 1rem; border-radius: 8px; gap: 1rem; font-size: 0.85rem; cursor: pointer; transition: border-color 0.2s; }}
+    .compact-row:hover {{ border-color: var(--primary); }}
     .compact-text {{ flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
-    .gallery-card {{ background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 10px; overflow: hidden; display: flex; flex-direction: column; }}
+    .gallery-card {{ background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 10px; overflow: hidden; display: flex; flex-direction: column; cursor: pointer; transition: all 0.2s; }}
+    .gallery-card:hover {{ border-color: var(--primary); transform: translateY(-2px); }}
     .gallery-img {{ width: 100%; height: 220px; object-fit: cover; border-bottom: 1px solid var(--card-border); }}
     .gallery-body {{ padding: 0.85rem; }}
+
+    /* Fullscreen Glassmorphic Tweet Detail Lightbox Modal */
+    .hud-modal-backdrop {{ position: fixed; inset: 0; background: rgba(3, 5, 10, 0.85); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); z-index: 200; display: none; align-items: center; justify-content: center; padding: 1.5rem; }}
+    .hud-modal-backdrop.open {{ display: flex; }}
+    .hud-modal-box {{ background: rgba(13, 17, 28, 0.95); border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 16px; width: 100%; max-width: 760px; max-height: 90vh; overflow-y: auto; display: flex; flex-direction: column; box-shadow: 0 25px 60px rgba(0, 0, 0, 0.9); animation: modalIn 0.2s cubic-bezier(0.16, 1, 0.3, 1); }}
+    @keyframes modalIn {{ from {{ opacity: 0; transform: scale(0.96); }} to {{ opacity: 1; transform: scale(1); }} }}
+    .hud-modal-header {{ padding: 1.25rem 1.5rem; border-bottom: 1px solid var(--card-border); display: flex; justify-content: space-between; align-items: center; }}
+    .hud-modal-body {{ padding: 1.5rem; display: flex; flex-direction: column; gap: 1.25rem; }}
+    .hud-modal-media {{ display: flex; flex-direction: column; gap: 0.75rem; }}
+    .hud-modal-img {{ width: 100%; max-height: 480px; object-fit: contain; background: #000; border-radius: 10px; border: 1px solid var(--card-border); }}
+    .hud-modal-actions {{ display: flex; flex-wrap: wrap; gap: 8px; padding-top: 1rem; border-top: 1px solid var(--card-border); }}
 
     /* Shimmer Skeleton */
     .skeleton {{ background: linear-gradient(90deg, #101524 25%, #192238 50%, #101524 75%); background-size: 200% 100%; animation: shimmer 1.5s infinite; border-radius: 6px; }}
@@ -361,7 +414,8 @@ async def index():
     .chat-msg {{ padding: 10px 14px; border-radius: 10px; line-height: 1.4; max-width: 90%; }}
     .chat-msg.user {{ align-self: flex-end; background: linear-gradient(135deg, #1d9bf0, #4f46e5); color: #fff; border-bottom-right-radius: 2px; }}
     .chat-msg.assistant {{ align-self: flex-start; background: rgba(255, 255, 255, 0.05); border: 1px solid var(--card-border); color: var(--text); border-bottom-left-radius: 2px; }}
-    .chat-source-card {{ font-size: 0.75rem; background: rgba(0, 0, 0, 0.4); border: 1px solid var(--card-border); padding: 6px 10px; border-radius: 6px; margin-top: 6px; }}
+    .chat-source-card {{ font-size: 0.75rem; background: rgba(0, 0, 0, 0.4); border: 1px solid var(--card-border); padding: 6px 10px; border-radius: 6px; margin-top: 6px; cursor: pointer; }}
+    .chat-source-card:hover {{ border-color: var(--primary); }}
     .chat-chip {{ font-size: 0.72rem; background: rgba(99, 102, 241, 0.15); color: #a5b4fc; border: 1px solid rgba(99, 102, 241, 0.3); padding: 4px 8px; border-radius: 6px; cursor: pointer; display: inline-block; transition: all 0.15s; }}
     .chat-chip:hover {{ background: rgba(99, 102, 241, 0.3); border-color: rgba(99, 102, 241, 0.6); }}
     .chat-input-row {{ padding: 12px 16px; border-top: 1px solid var(--card-border); display: flex; gap: 8px; background: rgba(8, 11, 18, 0.8); border-radius: 0 0 16px 16px; }}
@@ -374,13 +428,14 @@ async def index():
     .toast-progress-fill {{ background: linear-gradient(90deg, var(--primary), var(--success)); height: 100%; width: 0%; transition: width 0.3s ease; }}
     .toast-log {{ font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: var(--muted); max-height: 90px; overflow-y: auto; margin-top: 0.5rem; }}
     .hud-btn {{ background: rgba(255, 255, 255, 0.06); color: var(--text); border: 1px solid var(--card-border); padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; font-size: 0.8rem; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; transition: all 0.2s ease; }}
+    .hud-btn:hover {{ background: rgba(255, 255, 255, 0.12); border-color: rgba(255, 255, 255, 0.25); }}
   </style>
 </head>
 <body>
   <!-- Pure HUD Floating Topbar -->
   <header class="hud-topbar">
     <div style="display:flex; align-items:center; gap:10px;">
-      <a href="#" class="hud-brand">
+      <a href="#" class="hud-brand" onclick="clearFilters(); return false;">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
           <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
         </svg>
@@ -474,7 +529,10 @@ async def index():
       </div>
 
       <div class="controls-row">
-        <div class="hud-tag-cloud" id="tag-cloud-container">{tags_html}</div>
+        <div class="hud-tag-cloud" id="tag-cloud-container">
+          <span id="active-author-filter-slot"></span>
+          {tags_html}
+        </div>
 
         <div style="display:flex; gap:8px; align-items:center;">
           <!-- Sort Selector -->
@@ -520,6 +578,32 @@ async def index():
     <!-- Results Multi-Column Container -->
     <div id="results" class="cols-2 mode-card"></div>
     <div id="scroll-sentinel" style="height:20px; margin-top:1rem;"></div>
+  </div>
+
+  <!-- Fullscreen Glassmorphic Tweet Detail Lightbox Modal -->
+  <div id="hud-tweet-modal" class="hud-modal-backdrop" onclick="if(event.target===this) closeTweetModal()">
+    <div class="hud-modal-box">
+      <div class="hud-modal-header">
+        <div style="display:flex; align-items:center; gap:8px;">
+          <span style="font-size:1.1rem;">𝕏</span>
+          <h3 id="modal-author-name" style="font-size:0.95rem; font-weight:700;">Tweet Detail</h3>
+          <span id="modal-author-handle" style="color:var(--muted); font-family:'JetBrains Mono',monospace; font-size:0.85rem;"></span>
+        </div>
+        <button class="hud-icon-btn" onclick="closeTweetModal()" style="width:28px; height:28px;">✕</button>
+      </div>
+      <div class="hud-modal-body">
+        <div id="modal-tweet-text" class="tweet-text" style="font-size:1rem; line-height:1.5;"></div>
+        <div id="modal-media-container" class="hud-modal-media"></div>
+        <div id="modal-tags-container" style="display:flex; flex-wrap:wrap; gap:6px;"></div>
+        <div class="hud-modal-actions">
+          <button class="hud-btn" onclick="copyTweetText()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Copy Text</button>
+          <button class="hud-btn" onclick="copyTweetLink()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg> Copy Link</button>
+          <a id="modal-open-x-btn" href="#" target="_blank" class="hud-btn" style="text-decoration:none;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg> Open on 𝕏</a>
+          <button id="modal-filter-author-btn" class="hud-btn"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg> Filter by Author</button>
+          <button id="modal-unlike-btn" class="hud-btn" style="background:rgba(239,68,68,0.15); border-color:#ef4444; color:#f87171;" onclick="unlikeActiveModalTweet()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/><path d="m12 5-1 4 2 3-2 4"/></svg> Unlike on 𝕏</button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- HUD RAG Chat Drawer -->
@@ -609,6 +693,7 @@ async def index():
   <script>
     let currentQuery = '';
     let currentTag = null;
+    let currentAuthor = null;
     let currentSort = 'newest';
     let isSemantic = false;
     let currentOffset = 0;
@@ -621,7 +706,25 @@ async def index():
     let syncInterval = {sched.get('interval_sec', 600)};
     let searchDebounceTimer = null;
     const searchCache = new Map();
+    const loadedTweetsMap = new Map();
+    let activeModalTweet = null;
     const PAGE_LIMIT = 24;
+
+    function formatTweetText(text) {{
+      if (!text) return '';
+      let escaped = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      
+      // Auto-hyperlink URLs
+      escaped = escaped.replace(/(https?:\\/\\/[^\\s]+)/g, '<a href="$1" target="_blank" onclick="event.stopPropagation()">$1</a>');
+      
+      // Auto-hyperlink @mentions
+      escaped = escaped.replace(/@([a-zA-Z0-9_]+)/g, '<span class="tweet-mention" onclick="event.stopPropagation(); filterAuthor(\'$1\')">@$1</span>');
+      
+      // Auto-hyperlink #hashtags
+      escaped = escaped.replace(/#([a-zA-Z0-9_]+)/g, '<span class="tweet-hashtag" onclick="event.stopPropagation(); filterTag(\'$1\')">#$1</span>');
+      
+      return escaped;
+    }}
 
     function applyLayout() {{
       const results = document.getElementById('results');
@@ -693,7 +796,7 @@ async def index():
 
     async function loadLikes(append = false) {{
       if (isLoading) return;
-      const cacheKey = `${{currentQuery}}_${{currentTag}}_${{currentSort}}_${{isSemantic}}_${{currentOffset}}`;
+      const cacheKey = `${{currentQuery}}_${{currentTag}}_${{currentAuthor}}_${{currentSort}}_${{isSemantic}}_${{currentOffset}}`;
       if (searchCache.has(cacheKey)) {{
         const cachedData = searchCache.get(cacheKey);
         renderResults(cachedData, append);
@@ -708,7 +811,10 @@ async def index():
         hasMore = true;
       }}
 
-      const url = `/api/search?q=${{encodeURIComponent(currentQuery)}}&sort_by=${{currentSort}}&semantic=${{isSemantic}}&offset=${{currentOffset}}&limit=${{PAGE_LIMIT}}` + (currentTag ? `&tag=${{encodeURIComponent(currentTag)}}` : '');
+      let url = `/api/search?q=${{encodeURIComponent(currentQuery)}}&sort_by=${{currentSort}}&semantic=${{isSemantic}}&offset=${{currentOffset}}&limit=${{PAGE_LIMIT}}`;
+      if (currentTag) url += `&tag=${{encodeURIComponent(currentTag)}}`;
+      if (currentAuthor) url += `&author=${{encodeURIComponent(currentAuthor)}}`;
+
       try {{
         const res = await fetch(url);
         const data = await res.json();
@@ -735,50 +841,83 @@ async def index():
         return;
       }}
 
+      results.forEach(r => loadedTweetsMap.set(r.tweet_id, r));
+
       const html = results.map(r => {{
         const mediaList = (r.local_media_paths && r.local_media_paths.length)
           ? r.local_media_paths.map(p => `/media/${{p.split('/').pop()}}`)
           : (r.media_urls || []);
         const fallbackSrc = (r.media_urls && r.media_urls.length) ? r.media_urls[0] : '';
-        const authorDisplay = r.author_handle ? (r.author_handle.startsWith('@') ? r.author_handle : '@' + r.author_handle) : 'Post #' + r.tweet_id;
+        const cleanHandle = (r.author_handle || '').replace(/^@+/, '');
+        const authorDisplay = cleanHandle ? '@' + cleanHandle : 'Post #' + r.tweet_id;
+        const formattedText = formatTweetText(r.text);
 
         if (displayMode === 'list') {{
           return `
-            <div class="compact-row">
-              <span style="font-weight:600; color:var(--primary); min-width:120px; font-family:'JetBrains Mono',monospace;">${{authorDisplay}}</span>
+            <div class="compact-row" onclick="openTweetModal('${{r.tweet_id}}')">
+              <span class="author-interactive" onclick="event.stopPropagation(); filterAuthor('${{cleanHandle}}')">${{authorDisplay}}</span>
               <span class="compact-text">${{r.text}}</span>
-              <div style="display:flex; gap:0.25rem;">${{(r.tags || []).slice(0, 2).map(t => `<span class="hud-tag" style="font-size:0.7rem; padding:0.1rem 0.4rem;" onclick="filterTag('${{t}}')">${{t}}</span>`).join('')}}</div>
-              <a href="${{r.url}}" target="_blank" style="color:var(--muted); font-size:0.75rem;">Link</a>
+              <div style="display:flex; gap:0.25rem;">${{(r.tags || []).slice(0, 2).map(t => `<span class="hud-tag" style="font-size:0.7rem; padding:0.1rem 0.4rem;" onclick="event.stopPropagation(); filterTag('${{t}}')">${{t}}</span>`).join('')}}</div>
+              <a href="${{r.url}}" target="_blank" class="ext-link-icon" onclick="event.stopPropagation()" title="Open on X">↗</a>
             </div>
           `;
         }}
         if (displayMode === 'gallery') {{
           const mediaSrc = mediaList.length ? mediaList[0] : '';
           return `
-            <div class="gallery-card">
+            <div class="gallery-card" onclick="openTweetModal('${{r.tweet_id}}')">
               ${{mediaSrc ? `<img class="gallery-img" src="${{mediaSrc}}" onerror="this.src='${{fallbackSrc}}'" loading="lazy">` : '<div style=\"height:120px; background:#131926; display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:0.8rem;\">Text Post</div>'}}
               <div class="gallery-body">
-                <div class="tweet-header"><span><strong>${{r.author_name || authorDisplay}}</strong></span><a href="${{r.url}}" target="_blank" style="color:var(--primary)">View</a></div>
+                <div class="tweet-header">
+                  <span class="author-interactive" onclick="event.stopPropagation(); filterAuthor('${{cleanHandle}}')"><strong>${{r.author_name || authorDisplay}}</strong></span>
+                  <a href="${{r.url}}" target="_blank" class="ext-link-icon" onclick="event.stopPropagation()" title="Open on X">↗</a>
+                </div>
                 <p style="font-size:0.82rem; line-height:1.3; margin-bottom:0.5rem; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden;">${{r.text}}</p>
-                <div>${{(r.tags || []).slice(0, 3).map(t => `<span class="hud-tag" style="font-size:0.7rem; padding:0.1rem 0.4rem;" onclick="filterTag('${{t}}')">${{t}}</span>`).join(' ')}}</div>
+                <div>${{(r.tags || []).slice(0, 3).map(t => `<span class="hud-tag" style="font-size:0.7rem; padding:0.1rem 0.4rem;" onclick="event.stopPropagation(); filterTag('${{t}}')">${{t}}</span>`).join(' ')}}</div>
               </div>
             </div>
           `;
         }}
         return `
-          <div class="hud-tweet-card">
+          <div class="hud-tweet-card" onclick="openTweetModal('${{r.tweet_id}}')">
             <div>
-              <div class="tweet-header"><span><strong>${{r.author_name || authorDisplay}}</strong> <span style="color:var(--muted); font-family:'JetBrains Mono',monospace;">${{authorDisplay}}</span></span><a href="${{r.url}}" target="_blank" style="color:var(--primary)">View</a></div>
-              <p style="white-space:pre-wrap; line-height:1.4; font-size:0.9rem;">${{r.text}}</p>
-              ${{mediaList.length ? `<div class="media-grid">${{mediaList.map((m, idx) => `<img class="media-thumb" src="${{m}}" onerror="this.src='${{fallbackSrc}}'" loading="lazy">`).join('')}}</div>` : ''}}
+              <div class="tweet-header">
+                <div style="display:flex; align-items:center; gap:4px;">
+                  <span class="author-interactive" onclick="event.stopPropagation(); filterAuthor('${{cleanHandle}}')"><strong>${{r.author_name || cleanHandle}}</strong></span>
+                  <span class="handle-badge" onclick="event.stopPropagation(); filterAuthor('${{cleanHandle}}')">${{authorDisplay}}</span>
+                </div>
+                <a href="${{r.url}}" target="_blank" class="ext-link-icon" onclick="event.stopPropagation()" title="Open on X">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+                </a>
+              </div>
+              <div class="tweet-text">${{formattedText}}</div>
+              ${{mediaList.length ? `<div class="media-grid">${{mediaList.map(m => `<img class="media-thumb" src="${{m}}" onerror="this.src='${{fallbackSrc}}'" onclick="event.stopPropagation(); openTweetModal('${{r.tweet_id}}')" loading="lazy">`).join('')}}</div>` : ''}}
             </div>
-            <div style="margin-top:0.75rem">${{(r.tags || []).map(t => `<span class="hud-tag" onclick="filterTag('${{t}}')">${{t}}</span>`).join(' ')}}</div>
+            <div style="margin-top:0.75rem">${{(r.tags || []).map(t => `<span class="hud-tag" onclick="event.stopPropagation(); filterTag('${{t}}')">${{t}}</span>`).join(' ')}}</div>
           </div>
         `;
       }}).join('');
 
       container.insertAdjacentHTML('beforeend', html);
       currentOffset += results.length;
+    }}
+
+    function filterAuthor(handle) {{
+      if (!handle) return;
+      currentAuthor = handle.replace(/^@+/, '');
+      document.getElementById('active-author-filter-slot').innerHTML = `
+        <span class="active-author-pill" onclick="clearAuthorFilter()">
+          @${{currentAuthor}} <strong style="margin-left:4px;">✕</strong>
+        </span>
+      `;
+      closeTweetModal();
+      loadLikes(false);
+    }}
+
+    function clearAuthorFilter() {{
+      currentAuthor = null;
+      document.getElementById('active-author-filter-slot').innerHTML = '';
+      loadLikes(false);
     }}
 
     function filterTag(tag) {{
@@ -788,16 +927,105 @@ async def index():
       currentTag = tag;
       document.getElementById('query').value = '';
       currentQuery = '';
+      closeTweetModal();
       loadLikes(false);
     }}
 
     function clearFilters() {{
       document.querySelectorAll('.hud-tag').forEach(el => el.classList.remove('active'));
       currentTag = null;
+      clearAuthorFilter();
       document.getElementById('query').value = '';
       currentQuery = '';
       loadLikes(false);
     }}
+
+    /* Lightbox Modal Logic */
+    function openTweetModal(tweetId) {{
+      const tweet = loadedTweetsMap.get(tweetId);
+      if (!tweet) return;
+      activeModalTweet = tweet;
+
+      const cleanHandle = (tweet.author_handle || '').replace(/^@+/, '');
+      document.getElementById('modal-author-name').innerText = tweet.author_name || cleanHandle || 'Tweet';
+      document.getElementById('modal-author-handle').innerText = cleanHandle ? '@' + cleanHandle : '';
+      document.getElementById('modal-tweet-text').innerHTML = formatTweetText(tweet.text);
+      document.getElementById('modal-open-x-btn').href = tweet.url || `https://x.com/${{cleanHandle}}/status/${{tweet.tweet_id}}`;
+
+      const filterAuthorBtn = document.getElementById('modal-filter-author-btn');
+      if (cleanHandle) {{
+        filterAuthorBtn.style.display = 'inline-flex';
+        filterAuthorBtn.onclick = () => filterAuthor(cleanHandle);
+      }} else {{
+        filterAuthorBtn.style.display = 'none';
+      }}
+
+      const mediaContainer = document.getElementById('modal-media-container');
+      const mediaList = (tweet.local_media_paths && tweet.local_media_paths.length)
+        ? tweet.local_media_paths.map(p => `/media/${{p.split('/').pop()}}`)
+        : (tweet.media_urls || []);
+      const fallbackSrc = (tweet.media_urls && tweet.media_urls.length) ? tweet.media_urls[0] : '';
+      
+      if (mediaList.length > 0) {{
+        mediaContainer.innerHTML = mediaList.map(m => `
+          <a href="${{m}}" target="_blank" title="Click to view full image in new tab">
+            <img class="hud-modal-img" src="${{m}}" onerror="this.src='${{fallbackSrc}}'">
+          </a>
+        `).join('');
+      }} else {{
+        mediaContainer.innerHTML = '';
+      }}
+
+      const tagsContainer = document.getElementById('modal-tags-container');
+      tagsContainer.innerHTML = (tweet.tags || []).map(t => `<span class="hud-tag" onclick="filterTag('${{t}}')">${{t}}</span>`).join(' ');
+
+      document.getElementById('hud-tweet-modal').classList.add('open');
+    }}
+
+    function closeTweetModal() {{
+      document.getElementById('hud-tweet-modal').classList.remove('open');
+      activeModalTweet = null;
+    }}
+
+    function copyTweetText() {{
+      if (!activeModalTweet) return;
+      navigator.clipboard.writeText(activeModalTweet.text);
+      alert('Tweet text copied to clipboard!');
+    }}
+
+    function copyTweetLink() {{
+      if (!activeModalTweet) return;
+      const url = activeModalTweet.url || `https://x.com/i/web/status/${{activeModalTweet.tweet_id}}`;
+      navigator.clipboard.writeText(url);
+      alert('Tweet URL copied to clipboard!');
+    }}
+
+    async function unlikeActiveModalTweet() {{
+      if (!activeModalTweet) return;
+      if (!confirm('Unlike this tweet on X?')) return;
+      const res = await fetch('/api/maintenance/unlike-single', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ tweet_id: activeModalTweet.tweet_id }})
+      }});
+      const data = await res.json();
+      if (data.unliked) {{
+        alert('Tweet unliked successfully on X!');
+        closeTweetModal();
+      }} else {{
+        alert('Failed to unlike on X.');
+      }}
+    }}
+
+    document.addEventListener('keydown', (e) => {{
+      if (e.key === 'Escape') {{
+        closeTweetModal();
+        const drawer = document.getElementById('hud-chat-drawer');
+        if (drawer.classList.contains('open')) drawer.classList.remove('open');
+        const sheet = document.getElementById('hud-sidesheet');
+        if (sheet.classList.contains('open')) sheet.classList.remove('open');
+      }}
+    }});
 
     const observer = new IntersectionObserver((entries) => {{
       if (entries[0].isIntersecting && hasMore && !isLoading) {{
@@ -902,9 +1130,9 @@ async def index():
           const sources = data.sources || [];
           if (sources.length > 0) {{
             sourcesEl.innerHTML = '<strong style="color:var(--muted); font-size:0.75rem;">Cited Likes:</strong>' + sources.map(s => `
-              <div class="chat-source-card">
-                <strong>[${{s.index}}] @${{s.author_handle}}</strong>: ${{s.text.slice(0, 70)}}...
-                <a href="${{s.url}}" target="_blank" style="color:var(--primary); margin-left:4px;">[View]</a>
+              <div class="chat-source-card" onclick="openTweetModal('${{s.tweet_id}}')">
+                <strong>[${{s.index}}] @${{(s.author_handle || '').replace(/^@+/, '')}}</strong>: ${{s.text.slice(0, 70)}}...
+                <span style="color:var(--primary); margin-left:4px;">[View Detail]</span>
               </div>
             `).join('');
           }}
@@ -949,11 +1177,12 @@ async def index():
           toastLog.innerHTML += `<div>Scraped ${{data.tweets_found}} likes...</div>`;
           toastLog.scrollTop = toastLog.scrollHeight;
         }} else if (data.stage === 'item_done') {{
+          const cleanHandle = (data.author_handle || 'user').replace(/^@+/, '');
           toastTitle.innerText = `Ingesting (#${{data.current}})...`;
-          toastDetail.innerText = `@${{data.author_handle || 'user'}}: "${{data.text.slice(0, 30)}}..."`;
+          toastDetail.innerText = `@${{cleanHandle}}: "${{data.text.slice(0, 30)}}..."`;
           toastFill.style.width = `${{Math.min(90, 20 + data.current * 3)}}%`;
           toastPercent.innerText = `${{Math.min(90, 20 + data.current * 3)}}%`;
-          toastLog.innerHTML += `<div>[Saved] @${{data.author_handle}} ${{data.unliked ? '(Unliked on X)' : ''}}</div>`;
+          toastLog.innerHTML += `<div>[Saved] @${{cleanHandle}} ${{data.unliked ? '(Unliked on X)' : ''}}</div>`;
           toastLog.scrollTop = toastLog.scrollHeight;
         }} else if (data.stage === 'complete') {{
           toastFill.style.width = '100%';
@@ -1098,7 +1327,7 @@ async def index():
       topTags.forEach(tag => {{
         const url = `/api/search?q=&sort_by=newest&semantic=false&offset=0&limit=${{PAGE_LIMIT}}&tag=${{encodeURIComponent(tag)}}`;
         fetch(url).then(res => res.json()).then(data => {{
-          searchCache.set(`_${{tag}}_newest_false_0`, data);
+          searchCache.set(`_${{tag}}__newest_false_0`, data);
         }}).catch(() => {{}});
       }});
     }}

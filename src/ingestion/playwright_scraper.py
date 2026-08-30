@@ -144,10 +144,10 @@ class PlaywrightXScraper:
                         author_name = lines[0] if len(lines) > 0 else ""
                         handle_part = href.strip("/").split("/status/")[0] if "/status/" in href else ""
                         if handle_part and handle_part not in ["i", "web"]:
-                            author_handle = f"@{handle_part}"
+                            author_handle = handle_part.lstrip("@")
                         else:
                             handle_line = next((l for l in lines if l.startswith("@")), "")
-                            author_handle = handle_line or (f"@{author_name.lower().replace(' ', '')}" if author_name else "")
+                            author_handle = handle_line.lstrip("@") if handle_line else (author_name.lower().replace(" ", "") if author_name else "")
 
                         media_urls: list[str] = []
                         img_elements = await article.locator("div[data-testid='tweetPhoto'] img").all()
@@ -160,7 +160,7 @@ class PlaywrightXScraper:
                         tweet_obj = {
                             "id": tweet_id,
                             "tweet_id": tweet_id,
-                            "author_name": author_name or author_handle.lstrip("@"),
+                            "author_name": author_name or author_handle,
                             "author_handle": author_handle,
                             "text": tweet_text,
                             "created_at": "",
