@@ -51,19 +51,17 @@ class TwitterGraphQLClient:
         async with AsyncSession(impersonate="chrome120") as s:
             r = await s.get(url, headers=headers, params=params, timeout=15)
             if r.status_code != 200:
-                return ""
+                raise RuntimeError(f"UserByScreenName failed ({r.status_code}): {r.text[:80]}")
             data = r.json()
-            return data.get("data", {}).get("user", {}).get("result", {}).get("rest_id", "")
+            user_id = data.get("data", {}).get("user", {}).get("result", {}).get("rest_id", "")
+            if not user_id:
+                raise RuntimeError(f"Could not find rest_id for user '{screen_name}'.")
+            return user_id
 
     async def fetch_likes_page(self, user_id: str, cursor: str = "", count: int = 100) -> tuple[list[dict[str, Any]], str]:
         headers = self._get_auth_headers()
         url = f"https://x.com/i/api/graphql/{LIKES_QUERY_ID}/Likes"
-        variables = {
-            "userId": user_id,
-            "count": count,
-            "includePromotedContent": False,
-            "withVoice": False,
-        }
+        variables = {"userId": user_id, "count": count, "includePromotedContent": False, "withVoice": False}
         if cursor:
             variables["cursor"] = cursor
 
@@ -78,7 +76,7 @@ class TwitterGraphQLClient:
         async with AsyncSession(impersonate="chrome120") as s:
             r = await s.get(url, headers=headers, params=params, timeout=20)
             if r.status_code != 200:
-                return [], ""
+                raise RuntimeError(f"Likes GraphQL query failed ({r.status_code}): {r.text[:80]}")
             return self._parse_likes_response(r.json())
 
     def _parse_likes_response(self, data: dict[str, Any]) -> tuple[list[dict[str, Any]], str]:
@@ -98,7 +96,6 @@ class TwitterGraphQLClient:
                     item = entry.get("content", {}).get("itemContent", {}).get("tweet_results", {}).get("result", {})
                     if not item:
                         continue
-                    # Handle tweet with visibility results
                     legacy = item.get("legacy") or item.get("tweet", {}).get("legacy", {})
                     user_legacy = item.get("core", {}).get("user_results", {}).get("result", {}).get("legacy", {})
                     
@@ -143,7 +140,6 @@ class TwitterGraphQLClient:
         all_tweets: list[dict[str, Any]] = []
         user_id = await self.get_user_id(username) if username else ""
         if not user_id:
-            # Fallback user ID if profile lookup is empty
             data = json.loads(self.session_path.read_text())
             user_id = data.get("metadata", {}).get("user_id", "")
         if not user_id:
@@ -156,6 +152,8 @@ class TwitterGraphQLClient:
         while True:
             batch_num += 1
             batch, next_cursor = await self.fetch_likes_page(user_id=user_id, cursor=cursor, count=100)
+            if not batch and batch_num == 1:
+                raise RuntimeError("GraphQL Likes returned empty batch on first page.")
             if not batch:
                 break
 
