@@ -146,7 +146,8 @@ class BackgroundSyncScheduler:
 
             uname = status.get("username", "")
             try:
-                await self.gql_client.fetch_all_likes_streaming(username=uname, max_tweets=0, on_item_found=on_item_found)
+                async for tweet in self.gql_client.fetch_all_likes_streaming(username=uname, max_tweets=0):
+                    await on_item_found(tweet)
             except Exception:
                 engine_used = "playwright"
                 await self.scraper.scrape_likes(username=uname, max_tweets=0, on_item_found=on_item_found)

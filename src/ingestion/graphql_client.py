@@ -1,3 +1,4 @@
+import asyncio
 import json
 from pathlib import Path
 import httpx
@@ -32,11 +33,18 @@ LIKES_FEATURES = {
 }
 
 
+from src.server.config import SESSION_FILE, BACKUP_SESSION_FILE
+
+
 class TwitterGraphQLClient:
     def __init__(self, auth_token: str = "", ct0: str = "", session_path: Path | str | None = None):
-        if session_path and Path(session_path).exists():
+        target_path = Path(session_path) if session_path else SESSION_FILE
+        if not target_path.exists() and BACKUP_SESSION_FILE.exists():
+            target_path = BACKUP_SESSION_FILE
+
+        if target_path and target_path.exists():
             try:
-                data = json.loads(Path(session_path).read_text())
+                data = json.loads(target_path.read_text())
                 cookies = data.get("cookies", [])
                 auth_token = auth_token or next((c["value"] for c in cookies if c.get("name") == "auth_token"), "")
                 ct0 = ct0 or next((c["value"] for c in cookies if c.get("name") == "ct0"), "")
@@ -89,6 +97,7 @@ class TwitterGraphQLClient:
                     legacy = item.get("legacy") or item.get("tweet", {}).get("legacy", {})
                     core = item.get("core", {}) or item.get("tweet", {}).get("core", {})
                     user_res = core.get("user_results", {}).get("result", {})
+                    user_core = user_res.get("core", {})
                     user_legacy = user_res.get("legacy", {}) or user_res
                     
                     tweet_id = legacy.get("id_str", "") or item.get("rest_id", "")
@@ -96,8 +105,9 @@ class TwitterGraphQLClient:
                         continue
 
                     full_text = legacy.get("full_text", "")
-                    author_name = user_legacy.get("name", "") or user_res.get("name", "")
-                    author_handle = (user_legacy.get("screen_name", "") or user_res.get("screen_name", "")).lstrip("@")
+                    author_name = user_core.get("name", "") or user_legacy.get("name", "") or user_res.get("name", "")
+                    author_handle = (user_core.get("screen_name", "") or user_legacy.get("screen_name", "") or user_res.get("screen_name", "")).lstrip("@")
+                    favorite_count = int(legacy.get("favorite_count", 0))
 
                     media_urls: list[str] = []
                     for m in legacy.get("extended_entities", {}).get("media", []):
@@ -118,7 +128,8 @@ class TwitterGraphQLClient:
                         "media_urls": media_urls,
                         "local_media_paths": [],
                         "tags": [],
-                        "raw_json": json.dumps({"id": tweet_id, "text": full_text, "user": author_handle}),
+                        "favorite_count": favorite_count,
+                        "raw_json": json.dumps({"id": tweet_id, "text": full_text, "user": author_handle, "favorite_count": favorite_count}),
                     })
         except Exception:
             pass

@@ -79,9 +79,8 @@ async def stream_likes_sync(
         nonlocal engine_used
         try:
             uname = username or status.get("username", "")
-            return await gql_client.fetch_all_likes_streaming(
-                username=uname, max_tweets=max_tweets, on_progress=on_progress, on_item_found=on_item_found
-            )
+            async for tweet in gql_client.fetch_all_likes_streaming(username=uname, max_tweets=max_tweets):
+                await on_item_found(tweet)
         except Exception as gql_err:
             engine_used = "playwright"
             await event_queue.put({
