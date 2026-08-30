@@ -1,0 +1,9 @@
+{
+  "name": "@twitter-likes-organizer/plugin-lancedb",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "dependencies": {
+    "cordis": "^4.0.0-rc.8"
+  }
+}

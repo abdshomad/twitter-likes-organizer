@@ -1,0 +1,40 @@
+# Python virtual environment & cache
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node & Package Managers
+node_modules/
+dist/
+build/
+.turbo/
+
+# Environment Variables & Private Secrets
+.env
+.env.*
+!.env.example
+.secrets/
+*.session
+*.session.json
+*.key
+*.pem
+*.cert
+*.token
+
+# User Data & Storage (LanceDB, media cache, session tokens, raw exports)
+data/
+session.json
+sync_state.json
+like.js
+*.lance
+*.sqlite
+*.db
+
+# Runtime & Process artifacts
+*.pid
+*.log

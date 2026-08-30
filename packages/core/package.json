@@ -1,0 +1,19 @@
+{
+  "name": "@twitter-likes-organizer/core",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@twitter-likes-organizer/plugin-ai": "workspace:*",
+    "@twitter-likes-organizer/plugin-exporter": "workspace:*",
+    "@twitter-likes-organizer/plugin-ingestion": "workspace:*",
+    "@twitter-likes-organizer/plugin-lancedb": "workspace:*",
+    "@twitter-likes-organizer/plugin-media": "workspace:*",
+    "@twitter-likes-organizer/plugin-web-dashboard": "workspace:*",
+    "cordis": "^4.0.0-rc.8"
+  }
+}

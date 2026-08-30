@@ -1,0 +1,6 @@
+[submodule "autonomous-coding-agents"]
+	path = autonomous-coding-agents
+	url = https://github.com/abdshomad/autonomous-coding-agents.git
+[submodule "cordis"]
+	path = cordis
+	url = https://github.com/cordiverse/cordis.git

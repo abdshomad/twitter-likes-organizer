@@ -1,0 +1,26 @@
+{
+  "name": "twitter-likes-organizer-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm --filter @twitter-likes-organizer/core dev",
+    "start": "pm2 start ecosystem.config.cjs",
+    "stop": "pm2 stop twitter-likes-organizer-4024",
+    "restart": "pm2 restart twitter-likes-organizer-4024",
+    "test": "vitest run && uv run pytest -q",
+    "typecheck": "tsc -b"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "cordis": "^4.0.0-rc.8",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.5"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}
