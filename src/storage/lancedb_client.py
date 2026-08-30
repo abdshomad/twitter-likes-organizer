@@ -114,14 +114,16 @@ class LanceDBStore:
             except Exception:
                 pass
 
-        # Scan / Tag Filter
+        # Pushdown fast Tag / Scan query directly to LanceDB
         q = self.table.search()
         if where_expr:
             q = q.where(where_expr)
 
+        if not query and sort_by == "newest":
+            return q.offset(offset).limit(limit).to_list()
+
         items = q.to_list()
         if query:
-            # Fallback substring filter on text and author handle
             q_lower = query.lower()
             items = [t for t in items if q_lower in t.get("text", "").lower() or q_lower in t.get("author_handle", "").lower() or q_lower in t.get("author_name", "").lower()]
 

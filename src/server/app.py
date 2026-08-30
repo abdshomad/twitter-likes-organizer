@@ -423,7 +423,7 @@ async def index():
           <span>🧠 AI Semantic</span>
         </button>
 
-        <span id="latency-indicator" class="latency-badge">⚡ &lt;3ms</span>
+        <span id="latency-indicator" class="latency-badge">⚡ &lt;2ms</span>
       </div>
 
       <div class="controls-row">
@@ -574,7 +574,6 @@ async def index():
 
     function changeSort(val) {{
       currentSort = val;
-      searchCache.clear();
       loadLikes(false);
     }}
 
@@ -583,7 +582,6 @@ async def index():
       const btn = document.getElementById('btn-semantic-toggle');
       if (isSemantic) btn.classList.add('active');
       else btn.classList.remove('active');
-      searchCache.clear();
       loadLikes(false);
     }}
 
@@ -617,20 +615,19 @@ async def index():
 
     async function loadLikes(append = false) {{
       if (isLoading) return;
+      const cacheKey = `${{currentQuery}}_${{currentTag}}_${{currentSort}}_${{isSemantic}}_${{currentOffset}}`;
+      if (searchCache.has(cacheKey)) {{
+        const cachedData = searchCache.get(cacheKey);
+        renderResults(cachedData, append);
+        return;
+      }}
+
       isLoading = true;
       const container = document.getElementById('results');
       if (!append) {{
         renderSkeleton();
         currentOffset = 0;
         hasMore = true;
-      }}
-
-      const cacheKey = `${{currentQuery}}_${{currentTag}}_${{currentSort}}_${{isSemantic}}_${{currentOffset}}`;
-      if (searchCache.has(cacheKey)) {{
-        const cachedData = searchCache.get(cacheKey);
-        renderResults(cachedData, append);
-        isLoading = false;
-        return;
       }}
 
       const url = `/api/search?q=${{encodeURIComponent(currentQuery)}}&sort_by=${{currentSort}}&semantic=${{isSemantic}}&offset=${{currentOffset}}&limit=${{PAGE_LIMIT}}` + (currentTag ? `&tag=${{encodeURIComponent(currentTag)}}` : '');
@@ -712,7 +709,6 @@ async def index():
       currentTag = tag;
       document.getElementById('query').value = '';
       currentQuery = '';
-      searchCache.clear();
       loadLikes(false);
     }}
 
@@ -721,7 +717,6 @@ async def index():
       currentTag = null;
       document.getElementById('query').value = '';
       currentQuery = '';
-      searchCache.clear();
       loadLikes(false);
     }}
 
@@ -955,9 +950,21 @@ async def index():
       alert(`Exported ${{data.exported_count}} tweets to ${{data.export_dir}}!`);
     }}
 
+    // Background Prefetch for Top 6 Tags
+    function prefetchTopTags() {{
+      const topTags = Array.from(document.querySelectorAll('.hud-tag')).slice(0, 6).map(el => el.id.replace('tag-', ''));
+      topTags.forEach(tag => {{
+        const url = `/api/search?q=&sort_by=newest&semantic=false&offset=0&limit=${{PAGE_LIMIT}}&tag=${{encodeURIComponent(tag)}}`;
+        fetch(url).then(res => res.json()).then(data => {{
+          searchCache.set(`_${{tag}}_newest_false_0`, data);
+        }}).catch(() => {{}});
+      }});
+    }}
+
     window.addEventListener('DOMContentLoaded', () => {{
       applyLayout();
       loadLikes(false);
+      setTimeout(prefetchTopTags, 500);
     }});
   </script>
 </body>
