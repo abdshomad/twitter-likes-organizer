@@ -18,6 +18,7 @@ from src.ingestion.playwright_scraper import PlaywrightXScraper
 from src.ingestion.graphql_client import TwitterGraphQLClient
 from src.ingestion.unliker import TwitterUnliker
 from src.ingestion.sync_pipeline import stream_likes_sync
+from src.ingestion.author_hydrator import AuthorHydrator
 from src.ingestion.background_sync import BackgroundSyncScheduler
 
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
@@ -29,15 +30,33 @@ media_queue = MediaQueue(store=store)
 scraper = PlaywrightXScraper()
 unliker = TwitterUnliker(scraper.session_path)
 scheduler = BackgroundSyncScheduler(scraper, store, tagger, embedder, media_queue, interval_sec=600)
+author_hydrator = AuthorHydrator(store=store)
+
+
+async def author_hydrator_loop(hydrator: AuthorHydrator):
+    while True:
+        try:
+            count = await hydrator.hydrate_missing_authors(batch_size=30, concurrency=5)
+            if count == 0:
+                await asyncio.sleep(60)
+            else:
+                await asyncio.sleep(3)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            await asyncio.sleep(10)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     sched_task = asyncio.create_task(scheduler.start_loop())
     queue_task = asyncio.create_task(media_queue.worker_loop())
+    author_task = asyncio.create_task(author_hydrator_loop(author_hydrator))
     yield
     sched_task.cancel()
     queue_task.cancel()
+    author_task.cancel()
+    await author_hydrator.close()
 
 
 app = FastAPI(title="𝕏 Likes Organizer HUD", version="0.2.0", lifespan=lifespan)

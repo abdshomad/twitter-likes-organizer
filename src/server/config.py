@@ -10,4 +10,5 @@ PORT: int = int(os.getenv("PORT", "4024"))
 DATA_DIR: Path = Path(os.getenv("DATA_DIR", "data"))
 LANCEDB_DIR: Path = DATA_DIR / "lancedb"
 MEDIA_DIR: Path = DATA_DIR / "media"
-
+SESSION_FILE: Path = DATA_DIR / "auth" / "session.json"
+BACKUP_SESSION_FILE: Path = Path(os.path.expanduser("~/.twitter-likes-organizer/session.json"))
