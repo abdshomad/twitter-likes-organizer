@@ -97,17 +97,39 @@ class LanceDBStore:
     ) -> list[dict[str, Any]]:
         where_expr = f"array_contains(tags, '{tag}')" if tag else None
 
+        def extract_favorite_count(t: dict[str, Any]) -> int:
+            if "favorite_count" in t and t["favorite_count"] is not None:
+                try:
+                    return int(t["favorite_count"])
+                except Exception:
+                    pass
+            raw_str = t.get("raw_json", "")
+            if raw_str and raw_str != "{}":
+                try:
+                    raw = json.loads(raw_str)
+                    fc = raw.get("favorite_count") or raw.get("legacy", {}).get("favorite_count") or raw.get("like_count")
+                    if fc is not None:
+                        return int(fc)
+                except Exception:
+                    pass
+            return 0
+
         if query_vector and any(v != 0.0 for v in query_vector):
             q = self.table.search(query_vector)
             if where_expr:
                 q = q.where(where_expr)
-            return q.offset(offset).limit(limit).to_list()
+            res = q.offset(offset).limit(limit).to_list()
+            for r in res:
+                r["favorite_count"] = extract_favorite_count(r)
+            return res
 
         if query and not where_expr:
             try:
                 q = self.table.search(query, query_type="fts")
                 results = q.offset(offset).limit(limit).to_list()
                 if results:
+                    for r in results:
+                        r["favorite_count"] = extract_favorite_count(r)
                     return results
             except Exception:
                 pass
@@ -135,13 +157,18 @@ class LanceDBStore:
             items.sort(key=get_tweet_numeric_id, reverse=True)
         elif sort_by == "oldest_tweeted":
             items.sort(key=get_tweet_numeric_id)
+        elif sort_by == "most_liked":
+            items.sort(key=extract_favorite_count, reverse=True)
         elif sort_by == "media_only":
             items = [t for t in items if (t.get("media_urls") and len(t["media_urls"]) > 0) or (t.get("local_media_paths") and len(t["local_media_paths"]) > 0)]
             items.reverse()
         else:
             items.reverse()
 
-        return items[offset : offset + limit]
+        paged = items[offset : offset + limit]
+        for p in paged:
+            p["favorite_count"] = extract_favorite_count(p)
+        return paged
 
     def get_stats(self, force: bool = False) -> dict[str, int]:
         now = time.time()

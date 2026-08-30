@@ -436,6 +436,9 @@ async def index():
     .similar-card:hover {{ border-color: var(--primary); transform: translateY(-2px); background: rgba(29, 155, 240, 0.05); }}
     .similar-card-header {{ display: flex; align-items: center; justify-content: space-between; font-size: 0.75rem; }}
     .similar-card-text {{ font-size: 0.78rem; line-height: 1.35; color: #cbd5e1; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }}
+    
+    /* Like Count Badge */
+    .like-badge {{ display: inline-flex; align-items: center; gap: 4px; font-size: 0.72rem; color: #f43f5e; background: rgba(244, 63, 94, 0.12); border: 1px solid rgba(244, 63, 94, 0.28); padding: 2px 7px; border-radius: 999px; font-weight: 600; font-family: 'JetBrains Mono', monospace; }}
 
     /* Shimmer Skeleton */
     .skeleton {{ background: linear-gradient(90deg, #101524 25%, #192238 50%, #101524 75%); background-size: 200% 100%; animation: shimmer 1.5s infinite; border-radius: 6px; }}
@@ -598,6 +601,7 @@ async def index():
           <select id="select-sort" class="sort-select" onchange="changeSort(this.value)">
             <option value="newest_liked">⚡ Newest Liked</option>
             <option value="oldest_liked">🕰️ Oldest Liked</option>
+            <option value="most_liked">🔥 Most Liked</option>
             <option value="newest_tweeted">🐦 Newest Tweeted</option>
             <option value="oldest_tweeted">📜 Oldest Tweeted</option>
             <option value="media_only">🖼️ Media Only</option>
@@ -637,10 +641,11 @@ async def index():
     <div class="hud-modal-box">
       <div class="mobile-drag-handle"></div>
       <div class="hud-modal-header">
-        <div style="display:flex; align-items:center; gap:8px;">
+        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
           <span style="font-size:1.1rem;">𝕏</span>
           <h3 id="modal-author-name" style="font-size:0.95rem; font-weight:700;">Tweet Detail</h3>
           <span id="modal-author-handle" style="color:var(--muted); font-family:'JetBrains Mono',monospace; font-size:0.85rem;"></span>
+          <span id="modal-likes-count" class="like-badge" style="display:none;">❤️ 0</span>
         </div>
         <button class="hud-icon-btn" onclick="closeTweetModal()" style="width:28px; height:28px;">✕</button>
       </div>
@@ -949,6 +954,13 @@ async def index():
       return escaped;
     }}
 
+    function formatCount(n) {{
+      const num = parseInt(n || 0);
+      if (num >= 1000000) return (num / 1000000).toFixed(1).replace(/\\.0$/, '') + 'M';
+      if (num >= 1000) return (num / 1000).toFixed(1).replace(/\\.0$/, '') + 'K';
+      return num > 0 ? num.toString() : '0';
+    }}
+
     function applyLayout() {{
       const results = document.getElementById('results');
       results.className = (displayMode === 'list' ? 'cols-1' : 'cols-' + colCount) + ' mode-' + displayMode;
@@ -1106,7 +1118,10 @@ async def index():
             <div class="compact-row" onclick="openTweetModal('${{r.tweet_id}}')">
               <span class="author-interactive" onclick="event.stopPropagation(); filterAuthor('${{cleanHandle}}')">${{authorDisplay}}</span>
               <span class="compact-text">${{r.text}}</span>
-              <div style="display:flex; gap:0.25rem;">${{(r.tags || []).slice(0, 2).map(t => `<span class="hud-tag" style="font-size:0.7rem; padding:0.1rem 0.4rem;" onclick="event.stopPropagation(); filterTag('${{t}}')">${{t}}</span>`).join('')}}</div>
+              <div style="display:flex; gap:0.35rem; align-items:center;">
+                ${{(r.tags || []).slice(0, 2).map(t => `<span class="hud-tag" style="font-size:0.7rem; padding:0.1rem 0.4rem;" onclick="event.stopPropagation(); filterTag('${{t}}')">${{t}}</span>`).join('')}}
+                ${{r.favorite_count ? `<span class="like-badge" style="font-size:0.68rem; padding:1px 6px;">❤️ ${{formatCount(r.favorite_count)}}</span>` : ''}}
+              </div>
               <a href="${{r.url}}" target="_blank" class="ext-link-icon" onclick="event.stopPropagation()" title="Open on X">↗</a>
             </div>
           `;
@@ -1122,7 +1137,10 @@ async def index():
                   <a href="${{r.url}}" target="_blank" class="ext-link-icon" onclick="event.stopPropagation()" title="Open on X">↗</a>
                 </div>
                 <p style="font-size:0.82rem; line-height:1.3; margin-bottom:0.5rem; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden;">${{r.text}}</p>
-                <div>${{(r.tags || []).slice(0, 3).map(t => `<span class="hud-tag" style="font-size:0.7rem; padding:0.1rem 0.4rem;" onclick="event.stopPropagation(); filterTag('${{t}}')">${{t}}</span>`).join(' ')}}</div>
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-top:0.35rem;">
+                  <div>${{(r.tags || []).slice(0, 2).map(t => `<span class="hud-tag" style="font-size:0.7rem; padding:0.1rem 0.4rem;" onclick="event.stopPropagation(); filterTag('${{t}}')">${{t}}</span>`).join(' ')}}</div>
+                  ${{r.favorite_count ? `<span class="like-badge" style="font-size:0.68rem; padding:1px 6px;">❤️ ${{formatCount(r.favorite_count)}}</span>` : ''}}
+                </div>
               </div>
             </div>
           `;
@@ -1142,7 +1160,10 @@ async def index():
               <div class="tweet-text">${{formattedText}}</div>
               ${{mediaList.length ? `<div class="media-grid">${{mediaList.map(m => renderMediaElement(m, fallbackSrc, r.tweet_id, false)).join('')}}</div>` : ''}}
             </div>
-            <div style="margin-top:0.75rem">${{(r.tags || []).map(t => `<span class="hud-tag" onclick="event.stopPropagation(); filterTag('${{t}}')">${{t}}</span>`).join(' ')}}</div>
+            <div style="margin-top:0.75rem; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px;">
+              <div>${{(r.tags || []).map(t => `<span class="hud-tag" onclick="event.stopPropagation(); filterTag('${{t}}')">${{t}}</span>`).join(' ')}}</div>
+              ${{r.favorite_count ? `<span class="like-badge" title="${{r.favorite_count}} Likes">❤️ ${{formatCount(r.favorite_count)}}</span>` : ''}}
+            </div>
           </div>
         `;
       }}).join('');
@@ -1201,6 +1222,16 @@ async def index():
       document.getElementById('modal-tweet-text').innerHTML = formatTweetText(tweet.text);
       document.getElementById('modal-open-x-btn').href = tweet.url || `https://x.com/${{cleanHandle}}/status/${{tweet.tweet_id}}`;
 
+      const likesBadge = document.getElementById('modal-likes-count');
+      if (likesBadge) {{
+        if (tweet.favorite_count) {{
+          likesBadge.innerText = '❤️ ' + formatCount(tweet.favorite_count) + ' Likes';
+          likesBadge.style.display = 'inline-flex';
+        }} else {{
+          likesBadge.style.display = 'none';
+        }}
+      }}
+
       const filterAuthorBtn = document.getElementById('modal-filter-author-btn');
       if (cleanHandle) {{
         filterAuthorBtn.style.display = 'inline-flex';
@@ -1255,8 +1286,11 @@ async def index():
                     <span style="color:var(--muted); font-family:'JetBrains Mono',monospace;">${{cleanH ? '@' + cleanH : ''}}</span>
                   </div>
                   <div class="similar-card-text">${{s.text}}</div>
-                  <div style="display:flex; gap:4px; margin-top:2px;">
-                    ${{(s.tags || []).slice(0, 2).map(t => `<span class="hud-tag" style="font-size:0.65rem; padding:1px 5px;" onclick="event.stopPropagation(); filterTag('${{t}}')">${{t}}</span>`).join('')}}
+                  <div style="display:flex; justify-content:space-between; align-items:center; margin-top:2px;">
+                    <div style="display:flex; gap:4px;">
+                      ${{(s.tags || []).slice(0, 2).map(t => `<span class="hud-tag" style="font-size:0.65rem; padding:1px 5px;" onclick="event.stopPropagation(); filterTag('${{t}}')">${{t}}</span>`).join('')}}
+                    </div>
+                    ${{s.favorite_count ? `<span class="like-badge" style="font-size:0.65rem; padding:1px 5px;">❤️ ${{formatCount(s.favorite_count)}}</span>` : ''}}
                   </div>
                 </div>
               `;

@@ -27,7 +27,7 @@ def test_lancedb_crud(temp_lancedb):
             "local_media_paths": [],
             "tags": ["AI", "LLM", "Optimization"],
             "vector": [0.1] * 1024,
-            "raw_json": "{}",
+            "raw_json": '{"favorite_count": 42}',
         },
         {
             "id": "1002",
@@ -42,7 +42,7 @@ def test_lancedb_crud(temp_lancedb):
             "local_media_paths": [],
             "tags": ["Rust", "Search", "LanceDB"],
             "vector": [0.2] * 1024,
-            "raw_json": "{}",
+            "raw_json": '{"favorite_count": 950}',
         },
     ]
 
@@ -75,3 +75,8 @@ def test_lancedb_crud(temp_lancedb):
 
     oldest_tweeted = temp_lancedb.search_hybrid(sort_by="oldest_tweeted")
     assert oldest_tweeted[0]["tweet_id"] == "1001"
+
+    most_liked = temp_lancedb.search_hybrid(sort_by="most_liked")
+    assert most_liked[0]["tweet_id"] == "1002"
+    assert most_liked[0]["favorite_count"] == 950
+    assert most_liked[1]["favorite_count"] == 42
