@@ -5,12 +5,15 @@ import random
 from pathlib import Path
 from typing import Any, Callable, Awaitable
 from curl_cffi.requests import AsyncSession
-from playwright.async_api import async_playwright
 
 DEFAULT_DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULT_SESSION_PATH = DEFAULT_DATA_DIR / "session.json"
 BEARER_TOKEN = "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
-UNFAVORITE_QUERY_ID = "ZYKfl-48MoIZplqd7Anwlg"
+UNLIKE_ENDPOINTS = [
+    "https://x.com/i/api/1.1/favorites/destroy.json",
+    "https://api.x.com/1.1/favorites/destroy.json",
+    "https://twitter.com/i/api/1.1/favorites/destroy.json",
+]
 
 
 class TwitterUnliker:
@@ -38,66 +41,43 @@ class TwitterUnliker:
             "referer": "https://x.com/",
             "origin": "https://x.com",
             "accept": "*/*",
-            "content-type": "application/json",
+            "content-type": "application/x-www-form-urlencoded",
         }
         if ct0:
             headers["x-csrf-token"] = ct0
         return headers
 
-    async def unlike_tweet_graphql(self, tweet_id: str) -> tuple[bool, int]:
+    async def unlike_tweet_api(self, tweet_id: str) -> tuple[bool, int]:
         headers = self._get_auth_headers()
-        url = f"https://x.com/i/api/graphql/{UNFAVORITE_QUERY_ID}/UnfavoriteTweet"
-        payload = {"variables": {"tweet_id": tweet_id}, "queryId": UNFAVORITE_QUERY_ID}
+        payload = {"id": str(tweet_id)}
         async with AsyncSession(impersonate="chrome120") as s:
-            r = await s.post(url, headers=headers, json=payload, timeout=15)
-            if r.status_code == 200:
-                data = r.json()
-                return bool(data.get("data", {}).get("unfavorite_tweet")), 200
-            return False, r.status_code
-
-    async def unlike_tweet_playwright(self, tweet_url: str) -> bool:
-        if not self.session_path.exists():
-            return False
-        storage_data = json.loads(self.session_path.read_text())
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-            context = await browser.new_context(storage_state=storage_data)
-            page = await context.new_page()
-            try:
-                await page.goto(tweet_url, wait_until="domcontentloaded", timeout=15000)
-                unlike_btn = page.locator("button[data-testid='unlike']").first
-                if await unlike_btn.count() > 0:
-                    await unlike_btn.click()
-                    await page.wait_for_timeout(500)
-                    await browser.close()
-                    return True
-                await browser.close()
-                return False
-            except Exception:
-                await browser.close()
-                return False
+            for url in UNLIKE_ENDPOINTS:
+                try:
+                    r = await s.post(url, headers=headers, data=payload, timeout=12)
+                    if r.status_code == 200:
+                        return True, 200
+                    if r.status_code == 404:
+                        # 404 on destroy means already unliked or deleted -> considered success
+                        return True, 404
+                    if r.status_code == 429:
+                        return False, 429
+                except Exception:
+                    continue
+        return False, 500
 
     async def ensure_unliked(self, tweet_id: str, tweet_url: str = "", max_attempts: int = 3) -> tuple[bool, str]:
         for attempt in range(1, max_attempts + 1):
             try:
-                success, status_code = await self.unlike_tweet_graphql(tweet_id)
+                success, status_code = await self.unlike_tweet_api(tweet_id)
                 if success:
-                    return True, "graphql"
+                    return True, "api"
                 if status_code == 429:
-                    await asyncio.sleep(5.0)
+                    await asyncio.sleep(4.0)
             except Exception:
                 pass
 
-            if tweet_url:
-                try:
-                    pw_success = await self.unlike_tweet_playwright(tweet_url)
-                    if pw_success:
-                        return True, "playwright"
-                except Exception:
-                    pass
-
             if attempt < max_attempts:
-                await asyncio.sleep(1.0 * attempt)
+                await asyncio.sleep(0.8 * attempt)
 
         return False, "failed"
 
@@ -115,11 +95,10 @@ class TwitterUnliker:
 
         for idx, t in enumerate(tweets, start=1):
             tweet_id = t.get("tweet_id") or t.get("id")
-            url = t.get("url", f"https://x.com/i/web/status/{tweet_id}")
             if not tweet_id:
                 continue
 
-            success, _ = await self.ensure_unliked(str(tweet_id), url, max_attempts=3)
+            success, _ = await self.ensure_unliked(str(tweet_id), max_attempts=3)
             if success:
                 unliked_count += 1
 
@@ -133,7 +112,7 @@ class TwitterUnliker:
                     "success": success,
                 })
 
-            delay = random.uniform(0.8, 1.5)
+            delay = random.uniform(0.6, 1.2)
             await asyncio.sleep(delay)
 
         return unliked_count

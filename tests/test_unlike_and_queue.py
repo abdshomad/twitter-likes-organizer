@@ -39,3 +39,4 @@ async def test_unliker_headers_and_payload(tmp_path):
     assert "authorization" in headers
     assert "auth_token=test_token" in headers["cookie"]
     assert headers["x-csrf-token"] == "test_ct0"
+    assert headers["content-type"] == "application/x-www-form-urlencoded"
