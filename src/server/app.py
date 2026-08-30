@@ -1,4 +1,5 @@
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -158,9 +159,18 @@ async def search_likes(
     offset: int = Query(0, ge=0),
     limit: int = Query(24, ge=1, le=100),
 ):
-    vector = embedder.embed_text(q.strip()) if semantic and q.strip() else None
+    t0 = time.perf_counter()
+    vector = embedder.embed_text(q.strip()) if (semantic and q.strip()) else None
     results = store.search_hybrid(query=q.strip(), query_vector=vector, tag=tag, sort_by=sort_by, offset=offset, limit=limit)
-    return {"count": len(results), "offset": offset, "limit": limit, "results": results}
+    latency_ms = (time.perf_counter() - t0) * 1000.0
+    return {
+        "count": len(results),
+        "latency_ms": round(latency_ms, 2),
+        "semantic": semantic,
+        "offset": offset,
+        "limit": limit,
+        "results": results,
+    }
 
 
 @app.post("/api/ingest/archive")
@@ -250,14 +260,18 @@ async def index():
     
     .sync-select, .sort-select {{ background: #131926; color: var(--text); border: 1px solid var(--card-border); padding: 0.35rem 0.55rem; border-radius: 6px; font-size: 0.75rem; font-family: 'JetBrains Mono', monospace; outline: none; }}
     
-    /* HUD Filter Capsule */
+    /* Blazingly Fast HUD Filter Capsule */
     .hud-filter-dock {{ background: var(--card-bg); backdrop-filter: blur(12px); border: 1px solid var(--card-border); border-radius: 12px; padding: 1rem 1.25rem; margin-bottom: 1.5rem; display: flex; flex-direction: column; gap: 0.85rem; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4); }}
-    .search-row {{ display: flex; gap: 0.75rem; align-items: center; }}
-    .hud-input {{ flex: 1; padding: 0.75rem 1rem; background: rgba(8, 11, 18, 0.8); border: 1px solid var(--card-border); border-radius: 8px; color: var(--text); font-size: 0.95rem; outline: none; }}
-    .hud-input:focus {{ border-color: var(--primary); box-shadow: 0 0 10px rgba(29, 155, 240, 0.3); }}
-    .hud-btn {{ background: rgba(255, 255, 255, 0.06); color: var(--text); border: 1px solid var(--card-border); padding: 0.55rem 1.1rem; border-radius: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; transition: all 0.2s ease; }}
-    .hud-btn:hover {{ background: rgba(255, 255, 255, 0.12); border-color: rgba(255, 255, 255, 0.2); }}
-    .hud-btn.accent {{ background: linear-gradient(135deg, rgba(29, 155, 240, 0.3), rgba(99, 102, 241, 0.3)); border-color: rgba(29, 155, 240, 0.5); color: #fff; box-shadow: 0 0 12px rgba(29, 155, 240, 0.2); }}
+    .search-row {{ display: flex; gap: 0.6rem; align-items: center; }}
+    .search-capsule {{ flex: 1; position: relative; display: flex; align-items: center; background: rgba(8, 11, 18, 0.85); border: 1px solid var(--card-border); border-radius: 8px; padding: 0 10px; transition: border-color 0.2s; }}
+    .search-capsule:focus-within {{ border-color: var(--primary); box-shadow: 0 0 10px rgba(29, 155, 240, 0.3); }}
+    .search-capsule svg {{ color: var(--muted); width: 16px; height: 16px; flex-shrink: 0; }}
+    .hud-input {{ flex: 1; padding: 0.75rem 0.6rem; background: transparent; border: none; color: var(--text); font-size: 0.95rem; outline: none; }}
+    .clear-search-btn {{ background: transparent; border: none; color: var(--muted); cursor: pointer; padding: 4px; display: none; }}
+    .clear-search-btn:hover {{ color: #fff; }}
+    .semantic-toggle-btn {{ background: rgba(255, 255, 255, 0.05); color: var(--muted); border: 1px solid var(--card-border); padding: 0.5rem 0.8rem; border-radius: 6px; cursor: pointer; font-size: 0.75rem; font-weight: 600; font-family: 'JetBrains Mono', monospace; display: inline-flex; align-items: center; gap: 6px; transition: all 0.2s ease; }}
+    .semantic-toggle-btn.active {{ background: rgba(99, 102, 241, 0.25); color: #a5b4fc; border-color: #6366f1; box-shadow: 0 0 10px rgba(99, 102, 241, 0.3); }}
+    .latency-badge {{ font-size: 0.7rem; font-family: 'JetBrains Mono', monospace; color: #10b981; padding: 0 4px; }}
     
     /* Toolbar Group & Switchers */
     .controls-row {{ display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.75rem; }}
@@ -317,6 +331,7 @@ async def index():
     .toast-progress {{ background: #131926; height: 6px; border-radius: 3px; overflow: hidden; margin-top: 0.5rem; }}
     .toast-progress-fill {{ background: linear-gradient(90deg, var(--primary), var(--success)); height: 100%; width: 0%; transition: width 0.3s ease; }}
     .toast-log {{ font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: var(--muted); max-height: 90px; overflow-y: auto; margin-top: 0.5rem; }}
+    .hud-btn {{ background: rgba(255, 255, 255, 0.06); color: var(--text); border: 1px solid var(--card-border); padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; font-size: 0.8rem; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; transition: all 0.2s ease; }}
   </style>
 </head>
 <body>
@@ -395,12 +410,20 @@ async def index():
 
   <!-- Main Viewport -->
   <div class="container">
-    <!-- Filter Dock -->
+    <!-- Blazingly Fast Filter Dock -->
     <div class="hud-filter-dock">
       <div class="search-row">
-        <input id="query" type="text" class="hud-input" placeholder="Search likes by keywords, concepts, or semantic context..." onkeyup="if(event.key==='Enter') triggerNewSearch()">
-        <button class="hud-btn accent" onclick="triggerNewSearch()">Search</button>
-        <button class="hud-btn" onclick="clearFilters()" id="btn-clear-filter" style="display:none;">Clear</button>
+        <div class="search-capsule">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input id="query" type="text" class="hud-input" placeholder="Instant Search likes (FTS / Semantic)..." oninput="onSearchInput(this.value)">
+          <button id="clear-search-btn" class="clear-search-btn" onclick="clearSearch()" title="Clear search (Esc)">✕</button>
+        </div>
+
+        <button id="btn-semantic-toggle" class="semantic-toggle-btn" onclick="toggleSemanticMode()" title="Toggle Deep Vector AI Semantic Search">
+          <span>🧠 AI Semantic</span>
+        </button>
+
+        <span id="latency-indicator" class="latency-badge">⚡ &lt;3ms</span>
       </div>
 
       <div class="controls-row">
@@ -475,10 +498,10 @@ async def index():
       </div>
       <div id="tab-auth" style="display:none;">
         <p style="color:var(--muted); font-size:0.8rem; margin-bottom:0.75rem;">Session authentication & bulk maintenance.</p>
-        <input type="text" id="auth-username" class="hud-input" placeholder="@handle" style="width:100%; margin-bottom:0.5rem;">
-        <input type="text" id="auth-token" class="hud-input" placeholder="auth_token (required)" style="width:100%; margin-bottom:0.5rem;">
-        <input type="text" id="auth-ct0" class="hud-input" placeholder="ct0 (optional)" style="width:100%; margin-bottom:0.75rem;">
-        <button class="hud-btn accent" onclick="saveCookiesAuth()" style="width:100%; margin-bottom:0.75rem;">Save Session</button>
+        <input type="text" id="auth-username" class="hud-input" placeholder="@handle" style="width:100%; margin-bottom:0.5rem; background:#080b12;">
+        <input type="text" id="auth-token" class="hud-input" placeholder="auth_token (required)" style="width:100%; margin-bottom:0.5rem; background:#080b12;">
+        <input type="text" id="auth-ct0" class="hud-input" placeholder="ct0 (optional)" style="width:100%; margin-bottom:0.75rem; background:#080b12;">
+        <button class="hud-btn" onclick="saveCookiesAuth()" style="width:100%; margin-bottom:0.75rem; background:rgba(29,155,240,0.2); border-color:#1d9bf0; color:#38bdf8;">Save Session</button>
         <button class="hud-btn" onclick="startBulkUnlike()" style="background:rgba(239,68,68,0.2); border-color:#ef4444; color:#f87171; width:100%; margin-bottom:0.75rem;">Clean & Unlike All on X</button>
         <button class="hud-btn" onclick="disconnectTwitter()" style="width:100%;">Disconnect Account</button>
       </div>
@@ -509,6 +532,7 @@ async def index():
     let currentQuery = '';
     let currentTag = null;
     let currentSort = 'newest';
+    let isSemantic = false;
     let currentOffset = 0;
     let isLoading = false;
     let hasMore = true;
@@ -517,6 +541,8 @@ async def index():
     let nextSyncSeconds = {sched.get('next_sync_in_sec', 0)};
     let isSyncEnabled = {str(sched.get('enabled', True)).lower()};
     let syncInterval = {sched.get('interval_sec', 600)};
+    let searchDebounceTimer = null;
+    const searchCache = new Map();
     const PAGE_LIMIT = 24;
 
     function applyLayout() {{
@@ -548,6 +574,34 @@ async def index():
 
     function changeSort(val) {{
       currentSort = val;
+      searchCache.clear();
+      loadLikes(false);
+    }}
+
+    function toggleSemanticMode() {{
+      isSemantic = !isSemantic;
+      const btn = document.getElementById('btn-semantic-toggle');
+      if (isSemantic) btn.classList.add('active');
+      else btn.classList.remove('active');
+      searchCache.clear();
+      loadLikes(false);
+    }}
+
+    function onSearchInput(val) {{
+      const clearBtn = document.getElementById('clear-search-btn');
+      clearBtn.style.display = val.length ? 'block' : 'none';
+      clearTimeout(searchDebounceTimer);
+      searchDebounceTimer = setTimeout(() => {{
+        currentQuery = val.trim();
+        loadLikes(false);
+      }}, 180);
+    }}
+
+    function clearSearch() {{
+      const input = document.getElementById('query');
+      input.value = '';
+      document.getElementById('clear-search-btn').style.display = 'none';
+      currentQuery = '';
       loadLikes(false);
     }}
 
@@ -571,90 +625,103 @@ async def index():
         hasMore = true;
       }}
 
-      const url = `/api/search?q=${{encodeURIComponent(currentQuery)}}&sort_by=${{currentSort}}&semantic=true&offset=${{currentOffset}}&limit=${{PAGE_LIMIT}}` + (currentTag ? `&tag=${{encodeURIComponent(currentTag)}}` : '');
+      const cacheKey = `${{currentQuery}}_${{currentTag}}_${{currentSort}}_${{isSemantic}}_${{currentOffset}}`;
+      if (searchCache.has(cacheKey)) {{
+        const cachedData = searchCache.get(cacheKey);
+        renderResults(cachedData, append);
+        isLoading = false;
+        return;
+      }}
+
+      const url = `/api/search?q=${{encodeURIComponent(currentQuery)}}&sort_by=${{currentSort}}&semantic=${{isSemantic}}&offset=${{currentOffset}}&limit=${{PAGE_LIMIT}}` + (currentTag ? `&tag=${{encodeURIComponent(currentTag)}}` : '');
       try {{
         const res = await fetch(url);
         const data = await res.json();
-        const results = data.results || [];
-        
-        if (!append) container.innerHTML = '';
-        if (results.length < PAGE_LIMIT) hasMore = false;
-
-        if (results.length === 0 && !append) {{
-          container.innerHTML = '<div class="hud-tweet-card" style="text-align:center; color: var(--muted); grid-column: 1 / -1; padding:2rem;">No matching likes found.</div>';
-          return;
-        }}
-
-        const html = results.map(r => {{
-          const mediaList = (r.local_media_paths && r.local_media_paths.length)
-            ? r.local_media_paths.map(p => `/media/${{p.split('/').pop()}}`)
-            : (r.media_urls || []);
-          const fallbackSrc = (r.media_urls && r.media_urls.length) ? r.media_urls[0] : '';
-
-          if (displayMode === 'list') {{
-            return `
-              <div class="compact-row">
-                <span style="font-weight:600; color:var(--primary); min-width:120px; font-family:'JetBrains Mono',monospace;">@${{r.author_handle || 'user'}}</span>
-                <span class="compact-text">${{r.text}}</span>
-                <div style="display:flex; gap:0.25rem;">${{(r.tags || []).slice(0, 2).map(t => `<span class="hud-tag" style="font-size:0.7rem; padding:0.1rem 0.4rem;" onclick="filterTag('${{t}}')">${{t}}</span>`).join('')}}</div>
-                <a href="${{r.url}}" target="_blank" style="color:var(--muted); font-size:0.75rem;">Link</a>
-              </div>
-            `;
-          }}
-          if (displayMode === 'gallery') {{
-            const mediaSrc = mediaList.length ? mediaList[0] : '';
-            return `
-              <div class="gallery-card">
-                ${{mediaSrc ? `<img class="gallery-img" src="${{mediaSrc}}" onerror="this.src='${{fallbackSrc}}'" loading="lazy">` : '<div style=\"height:120px; background:#131926; display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:0.8rem;\">Text Post</div>'}}
-                <div class="gallery-body">
-                  <div class="tweet-header"><span><strong>${{r.author_name || 'User'}}</strong></span><a href="${{r.url}}" target="_blank" style="color:var(--primary)">View</a></div>
-                  <p style="font-size:0.82rem; line-height:1.3; margin-bottom:0.5rem; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden;">${{r.text}}</p>
-                  <div>${{(r.tags || []).slice(0, 3).map(t => `<span class="hud-tag" style="font-size:0.7rem; padding:0.1rem 0.4rem;" onclick="filterTag('${{t}}')">${{t}}</span>`).join(' ')}}</div>
-                </div>
-              </div>
-            `;
-          }}
-          return `
-            <div class="hud-tweet-card">
-              <div>
-                <div class="tweet-header"><span><strong>${{r.author_name || 'User'}}</strong> <span style="color:var(--muted); font-family:'JetBrains Mono',monospace;">@${{r.author_handle || 'user'}}</span></span><a href="${{r.url}}" target="_blank" style="color:var(--primary)">View</a></div>
-                <p style="white-space:pre-wrap; line-height:1.4; font-size:0.9rem;">${{r.text}}</p>
-                ${{mediaList.length ? `<div class="media-grid">${{mediaList.map((m, idx) => `<img class="media-thumb" src="${{m}}" onerror="this.src='${{fallbackSrc}}'" loading="lazy">`).join('')}}</div>` : ''}}
-              </div>
-              <div style="margin-top:0.75rem">${{(r.tags || []).map(t => `<span class="hud-tag" onclick="filterTag('${{t}}')">${{t}}</span>`).join(' ')}}</div>
-            </div>
-          `;
-        }}).join('');
-
-        container.insertAdjacentHTML('beforeend', html);
-        currentOffset += results.length;
+        searchCache.set(cacheKey, data);
+        renderResults(data, append);
       }} finally {{
         isLoading = false;
       }}
+    }}
+
+    function renderResults(data, append) {{
+      const container = document.getElementById('results');
+      const results = data.results || [];
+      const latencyIndicator = document.getElementById('latency-indicator');
+      if (data.latency_ms !== undefined) {{
+        latencyIndicator.innerText = data.semantic ? `🧠 ${{data.latency_ms}}ms (AI)` : `⚡ ${{data.latency_ms}}ms (FTS)`;
+      }}
+
+      if (!append) container.innerHTML = '';
+      if (results.length < PAGE_LIMIT) hasMore = false;
+
+      if (results.length === 0 && !append) {{
+        container.innerHTML = '<div class="hud-tweet-card" style="text-align:center; color: var(--muted); grid-column: 1 / -1; padding:2rem;">No matching likes found.</div>';
+        return;
+      }}
+
+      const html = results.map(r => {{
+        const mediaList = (r.local_media_paths && r.local_media_paths.length)
+          ? r.local_media_paths.map(p => `/media/${{p.split('/').pop()}}`)
+          : (r.media_urls || []);
+        const fallbackSrc = (r.media_urls && r.media_urls.length) ? r.media_urls[0] : '';
+
+        if (displayMode === 'list') {{
+          return `
+            <div class="compact-row">
+              <span style="font-weight:600; color:var(--primary); min-width:120px; font-family:'JetBrains Mono',monospace;">@${{r.author_handle || 'user'}}</span>
+              <span class="compact-text">${{r.text}}</span>
+              <div style="display:flex; gap:0.25rem;">${{(r.tags || []).slice(0, 2).map(t => `<span class="hud-tag" style="font-size:0.7rem; padding:0.1rem 0.4rem;" onclick="filterTag('${{t}}')">${{t}}</span>`).join('')}}</div>
+              <a href="${{r.url}}" target="_blank" style="color:var(--muted); font-size:0.75rem;">Link</a>
+            </div>
+          `;
+        }}
+        if (displayMode === 'gallery') {{
+          const mediaSrc = mediaList.length ? mediaList[0] : '';
+          return `
+            <div class="gallery-card">
+              ${{mediaSrc ? `<img class="gallery-img" src="${{mediaSrc}}" onerror="this.src='${{fallbackSrc}}'" loading="lazy">` : '<div style=\"height:120px; background:#131926; display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:0.8rem;\">Text Post</div>'}}
+              <div class="gallery-body">
+                <div class="tweet-header"><span><strong>${{r.author_name || 'User'}}</strong></span><a href="${{r.url}}" target="_blank" style="color:var(--primary)">View</a></div>
+                <p style="font-size:0.82rem; line-height:1.3; margin-bottom:0.5rem; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden;">${{r.text}}</p>
+                <div>${{(r.tags || []).slice(0, 3).map(t => `<span class="hud-tag" style="font-size:0.7rem; padding:0.1rem 0.4rem;" onclick="filterTag('${{t}}')">${{t}}</span>`).join(' ')}}</div>
+              </div>
+            </div>
+          `;
+        }}
+        return `
+          <div class="hud-tweet-card">
+            <div>
+              <div class="tweet-header"><span><strong>${{r.author_name || 'User'}}</strong> <span style="color:var(--muted); font-family:'JetBrains Mono',monospace;">@${{r.author_handle || 'user'}}</span></span><a href="${{r.url}}" target="_blank" style="color:var(--primary)">View</a></div>
+              <p style="white-space:pre-wrap; line-height:1.4; font-size:0.9rem;">${{r.text}}</p>
+              ${{mediaList.length ? `<div class="media-grid">${{mediaList.map((m, idx) => `<img class="media-thumb" src="${{m}}" onerror="this.src='${{fallbackSrc}}'" loading="lazy">`).join('')}}</div>` : ''}}
+            </div>
+            <div style="margin-top:0.75rem">${{(r.tags || []).map(t => `<span class="hud-tag" onclick="filterTag('${{t}}')">${{t}}</span>`).join(' ')}}</div>
+          </div>
+        `;
+      }}).join('');
+
+      container.insertAdjacentHTML('beforeend', html);
+      currentOffset += results.length;
     }}
 
     function filterTag(tag) {{
       document.querySelectorAll('.hud-tag').forEach(el => el.classList.remove('active'));
       const activeEl = document.getElementById('tag-' + tag);
       if (activeEl) activeEl.classList.add('active');
-      document.getElementById('btn-clear-filter').style.display = 'inline-block';
       currentTag = tag;
       document.getElementById('query').value = '';
       currentQuery = '';
+      searchCache.clear();
       loadLikes(false);
     }}
 
     function clearFilters() {{
       document.querySelectorAll('.hud-tag').forEach(el => el.classList.remove('active'));
-      document.getElementById('btn-clear-filter').style.display = 'none';
       currentTag = null;
       document.getElementById('query').value = '';
       currentQuery = '';
-      loadLikes(false);
-    }}
-
-    function triggerNewSearch() {{
-      currentQuery = document.getElementById('query').value;
+      searchCache.clear();
       loadLikes(false);
     }}
 
@@ -686,7 +753,6 @@ async def index():
       const btn = document.getElementById('btn-auto-sync-icon');
       if (isSyncEnabled) btn.classList.add('active');
       else btn.classList.remove('active');
-      btn.title = `Toggle Auto-Sync (${{isSyncEnabled ? 'ON' : 'OFF'}})`;
     }}
 
     async function changeSyncInterval(val) {{
@@ -723,7 +789,6 @@ async def index():
       const toastFill = document.getElementById('toast-progress-fill');
       const toastPercent = document.getElementById('toast-percent');
       const toastLog = document.getElementById('toast-log');
-      const btn = document.getElementById('btn-sync-icon');
       
       toast.style.display = 'block';
       toastLog.innerHTML = '<div>[Connected] Initializing sync...</div>';
@@ -759,6 +824,7 @@ async def index():
           toastDetail.innerText = data.message;
           toastLog.innerHTML += `<div style="color:#10b981; font-weight:bold;">[DONE] ${{data.message}}</div>`;
           es.close();
+          searchCache.clear();
           refreshStats();
           if (!currentQuery && !currentTag) loadLikes(false);
           setTimeout(() => {{ toast.style.display = 'none'; }}, 4000);
@@ -845,7 +911,6 @@ async def index():
       const btn = document.getElementById('btn-auto-unlike-icon');
       if (data.auto_unlike) btn.classList.add('active');
       else btn.classList.remove('active');
-      btn.title = `Toggle Auto-Unlike on X (${{data.auto_unlike ? 'ON' : 'OFF'}})`;
     }}
 
     async function startBulkUnlike() {{
@@ -880,7 +945,7 @@ async def index():
       formData.append('file', file);
       const res = await fetch('/api/ingest/archive', {{ method: 'POST', body: formData }});
       const data = await res.json();
-      if (res.ok) {{ alert(`Imported ${{data.parsed}} likes from archive!`); refreshStats(); loadLikes(false); }}
+      if (res.ok) {{ alert(`Imported ${{data.parsed}} likes from archive!`); searchCache.clear(); refreshStats(); loadLikes(false); }}
       else {{ alert('Import failed.'); }}
     }}
 

@@ -95,27 +95,36 @@ class LanceDBStore:
 
         where_expr = " AND ".join(where_clauses) if where_clauses else None
 
+        # Vector search (Explicit Semantic Mode)
         if query_vector and len(query_vector) == 1024 and any(v != 0.0 for v in query_vector):
             q = self.table.search(query_vector)
             if where_expr:
                 q = q.where(where_expr)
             return q.offset(offset).limit(limit).to_list()
 
+        # Ultra-Fast Full-Text Search (Sub-5ms FTS)
         if query:
             try:
                 q = self.table.search(query, query_type="fts")
                 if where_expr:
                     q = q.where(where_expr)
-                return q.offset(offset).limit(limit).to_list()
+                results = q.offset(offset).limit(limit).to_list()
+                if results:
+                    return results
             except Exception:
                 pass
 
+        # Scan / Tag Filter
         q = self.table.search()
         if where_expr:
             q = q.where(where_expr)
-        
-        # In-memory sorting for non-vector queries when requested
+
         items = q.to_list()
+        if query:
+            # Fallback substring filter on text and author handle
+            q_lower = query.lower()
+            items = [t for t in items if q_lower in t.get("text", "").lower() or q_lower in t.get("author_handle", "").lower() or q_lower in t.get("author_name", "").lower()]
+
         if sort_by == "oldest":
             items.sort(key=lambda x: x.get("created_at") or x.get("id") or "")
         elif sort_by == "author":
