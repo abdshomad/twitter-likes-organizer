@@ -40,7 +40,6 @@ class LanceDBStore:
                 self.table_name, schema=SCHEMA, mode="create"
             )
 
-
     def _ensure_fts_index(self):
         if len(self.table) > 0:
             try:
@@ -80,36 +79,34 @@ class LanceDBStore:
         query: str = "",
         query_vector: list[float] | None = None,
         tag: str | None = None,
-        limit: int = 50,
+        offset: int = 0,
+        limit: int = 20,
     ) -> list[dict[str, Any]]:
         if len(self.table) == 0:
             return []
 
-        # Vector search takes priority if query_vector provided
         if query_vector and len(query_vector) == 1024 and any(v != 0.0 for v in query_vector):
             q = self.table.search(query_vector)
             if tag:
                 escaped_tag = tag.replace("'", "''")
                 q = q.where(f"array_has(tags, '{escaped_tag}')")
-            return q.limit(limit).to_list()
+            return q.offset(offset).limit(limit).to_list()
 
-        # Full-text search
         if query:
             try:
                 q = self.table.search(query, query_type="fts")
                 if tag:
                     escaped_tag = tag.replace("'", "''")
                     q = q.where(f"array_has(tags, '{escaped_tag}')")
-                return q.limit(limit).to_list()
+                return q.offset(offset).limit(limit).to_list()
             except Exception:
                 pass
 
-        # Tag filter / scan fallback
         q = self.table.search()
         if tag:
             escaped_tag = tag.replace("'", "''")
             q = q.where(f"array_has(tags, '{escaped_tag}')")
-        return q.limit(limit).to_list()
+        return q.offset(offset).limit(limit).to_list()
 
     def get_stats(self) -> dict[str, int]:
         total = len(self.table) if hasattr(self, "table") else 0

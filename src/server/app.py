@@ -135,7 +135,7 @@ async def auth_disconnect():
 @app.get("/api/sync/stream")
 async def sync_stream(max_tweets: int = 0, username: str = ""):
     sched_status = scheduler.get_status()
-    auto_unlike = sched_status.get("auto_unlike", False)
+    auto_unlike = sched_status.get("auto_unlike", True)
     return StreamingResponse(
         stream_likes_sync(scraper, store, tagger, embedder, media_queue, username, max_tweets, auto_unlike),
         media_type="text/event-stream",
@@ -147,11 +147,12 @@ async def search_likes(
     q: str = Query("", description="Search query"),
     tag: str | None = Query(None, description="Tag filter"),
     semantic: bool = Query(False, description="Enable vector semantic search"),
-    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(15, ge=1, le=100),
 ):
     vector = embedder.embed_text(q.strip()) if semantic and q.strip() else None
-    results = store.search_hybrid(query=q.strip(), query_vector=vector, tag=tag, limit=limit)
-    return {"count": len(results), "results": results}
+    results = store.search_hybrid(query=q.strip(), query_vector=vector, tag=tag, offset=offset, limit=limit)
+    return {"count": len(results), "offset": offset, "limit": limit, "results": results}
 
 
 @app.post("/api/ingest/archive")
@@ -179,8 +180,8 @@ async def export_markdown():
 async def index():
     stats = store.get_stats()
     q_stat = media_queue.get_status()
-    tags = store.get_all_tags()[:15]
-    tags_html = "".join([f"<span class='tag' onclick='filterTag(\"{t['tag']}\")'>{t['tag']} ({t['count']})</span>" for t in tags])
+    tags = store.get_all_tags()[:25]
+    tags_html = "".join([f"<span class='tag' id='tag-{t['tag']}' onclick='filterTag(\"{t['tag']}\")'>{t['tag']} ({t['count']})</span>" for t in tags])
     auth = scraper.get_session_status()
     sched = scheduler.get_status()
     notifs = history.get_notifications(limit=10)
@@ -212,9 +213,12 @@ async def index():
     button.secondary {{ background: #27272a; color: var(--text); }}
     button:hover {{ opacity: 0.9; }}
     .tag-cloud {{ display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1.5rem; }}
-    .tag {{ background: rgba(29,155,240,0.15); color: var(--primary); padding: 0.25rem 0.6rem; border-radius: 999px; font-size: 0.8rem; cursor: pointer; }}
+    .tag {{ background: rgba(29,155,240,0.15); color: var(--primary); padding: 0.25rem 0.6rem; border-radius: 999px; font-size: 0.8rem; cursor: pointer; transition: all 0.2s ease; }}
+    .tag:hover {{ background: rgba(29,155,240,0.3); }}
+    .tag.active {{ background: var(--primary); color: #fff; font-weight: bold; }}
     #results {{ display: flex; flex-direction: column; gap: 1rem; }}
-    .tweet-card {{ background: var(--card); border: 1px solid var(--border); padding: 1.25rem; border-radius: 8px; }}
+    .tweet-card {{ background: var(--card); border: 1px solid var(--border); padding: 1.25rem; border-radius: 8px; transition: transform 0.15s ease; }}
+    .tweet-card:hover {{ border-color: rgba(29,155,240,0.4); }}
     .tweet-header {{ display: flex; justify-content: space-between; color: var(--muted); font-size: 0.85rem; margin-bottom: 0.5rem; }}
     .sync-drawer {{ display: none; background: #0e111a; border: 1px solid var(--border); border-radius: 8px; padding: 1.25rem; margin-bottom: 1.5rem; }}
     .progress-bar-bg {{ background: #1e2330; border-radius: 6px; height: 10px; overflow: hidden; margin: 0.75rem 0; }}
@@ -233,6 +237,11 @@ async def index():
     .status-tag.success {{ background: rgba(16,185,129,0.2); color: var(--success); }}
     .status-tag.error {{ background: rgba(239,68,68,0.2); color: #ef4444; }}
     .notif-card {{ background: #090a0f; border: 1px solid var(--border); padding: 0.85rem; border-radius: 6px; margin-bottom: 0.75rem; }}
+    .skeleton {{ background: linear-gradient(90deg, #151926 25%, #1e2436 50%, #151926 75%); background-size: 200% 100%; animation: shimmer 1.5s infinite; border-radius: 4px; }}
+    @keyframes shimmer {{ 0% {{ background-position: 200% 0; }} 100% {{ background-position: -200% 0; }} }}
+    .skeleton-card {{ background: var(--card); border: 1px solid var(--border); padding: 1.25rem; border-radius: 8px; margin-bottom: 1rem; }}
+    .media-grid {{ display: flex; gap: 0.5rem; margin-top: 0.75rem; overflow-x: auto; }}
+    .media-thumb {{ max-height: 180px; border-radius: 6px; object-fit: cover; border: 1px solid var(--border); }}
   </style>
 </head>
 <body>
@@ -266,7 +275,7 @@ async def index():
         <div id="progress-fill" class="progress-bar-fill"></div>
       </div>
       <div id="feed-terminal" class="feed-terminal">
-        <div>[Ready] Ultra-fast Decoupled 2-Stage Ingestion Pipeline with Auto-Unlike on X.</div>
+        <div>[Ready] Decoupled 2-stage pipeline with instant lazy-loaded tag browsing.</div>
       </div>
     </div>
 
@@ -280,11 +289,13 @@ async def index():
       <div class="card"><h4>Tags</h4><p id="stat-tags">{stats['tags_count']}</p></div>
     </div>
     <div class="search-bar">
-      <input id="query" type="text" placeholder="Search likes (FTS + Vector Semantic)..." onkeyup="if(event.key==='Enter') search()">
-      <button onclick="search()">Search</button>
+      <input id="query" type="text" placeholder="Search likes (FTS + Vector Semantic)..." onkeyup="if(event.key==='Enter') triggerNewSearch()">
+      <button onclick="triggerNewSearch()">Search</button>
+      <button class="secondary" onclick="clearFilters()" id="btn-clear-filter" style="display:none;">Clear Filter</button>
     </div>
     <div class="tag-cloud">{tags_html}</div>
     <div id="results"></div>
+    <div id="scroll-sentinel" style="height:20px; margin-top:1rem;"></div>
   </div>
 
   <div class="modal" id="history-modal">
@@ -343,25 +354,98 @@ async def index():
   </div>
 
   <script>
-    async function search(tag = null) {{
-      const q = document.getElementById('query').value;
-      const url = `/api/search?q=${{encodeURIComponent(q)}}&semantic=true` + (tag ? `&tag=${{encodeURIComponent(tag)}}` : '');
-      const res = await fetch(url);
-      const data = await res.json();
+    let currentQuery = '';
+    let currentTag = null;
+    let currentOffset = 0;
+    let isLoading = false;
+    let hasMore = true;
+    const PAGE_LIMIT = 15;
+
+    function renderSkeleton() {{
       const container = document.getElementById('results');
-      if (!data.results || data.results.length === 0) {{
-        container.innerHTML = '<div class="card" style="text-align:center; color: var(--muted);">No matching likes found.</div>';
-        return;
-      }}
-      container.innerHTML = data.results.map(r => `
-        <div class="tweet-card">
-          <div class="tweet-header"><span>@${{r.author_handle || 'user'}}</span><a href="${{r.url}}" target="_blank" style="color:var(--primary)">View on X</a></div>
-          <p>${{r.text}}</p>
-          <div style="margin-top:0.75rem">${{(r.tags || []).map(t => `<span class="tag">${{t}}</span>`).join(' ')}}</div>
-        </div>
-      `).join('');
+      container.innerHTML = `
+        <div class="skeleton-card"><div class="skeleton" style="height:16px; width:30%; margin-bottom:10px;"></div><div class="skeleton" style="height:14px; width:90%; margin-bottom:8px;"></div><div class="skeleton" style="height:14px; width:70%;"></div></div>
+        <div class="skeleton-card"><div class="skeleton" style="height:16px; width:25%; margin-bottom:10px;"></div><div class="skeleton" style="height:14px; width:95%; margin-bottom:8px;"></div><div class="skeleton" style="height:14px; width:60%;"></div></div>
+        <div class="skeleton-card"><div class="skeleton" style="height:16px; width:35%; margin-bottom:10px;"></div><div class="skeleton" style="height:14px; width:80%; margin-bottom:8px;"></div></div>
+      `;
     }}
-    function filterTag(tag) {{ document.getElementById('query').value = ''; search(tag); }}
+
+    async function loadLikes(append = false) {{
+      if (isLoading) return;
+      isLoading = true;
+      const container = document.getElementById('results');
+      if (!append) {{
+        renderSkeleton();
+        currentOffset = 0;
+        hasMore = true;
+      }}
+
+      const url = `/api/search?q=${{encodeURIComponent(currentQuery)}}&semantic=true&offset=${{currentOffset}}&limit=${{PAGE_LIMIT}}` + (currentTag ? `&tag=${{encodeURIComponent(currentTag)}}` : '');
+      try {{
+        const res = await fetch(url);
+        const data = await res.json();
+        const results = data.results || [];
+        
+        if (!append) container.innerHTML = '';
+        if (results.length < PAGE_LIMIT) hasMore = false;
+
+        if (results.length === 0 && !append) {{
+          container.innerHTML = '<div class="card" style="text-align:center; color: var(--muted);">No matching likes found.</div>';
+          return;
+        }}
+
+        const html = results.map(r => `
+          <div class="tweet-card">
+            <div class="tweet-header"><span><strong>${{r.author_name || 'User'}}</strong> <span style="color:var(--muted)">@${{r.author_handle || 'user'}}</span></span><a href="${{r.url}}" target="_blank" style="color:var(--primary)">View on X</a></div>
+            <p style="white-space:pre-wrap; line-height:1.4;">${{r.text}}</p>
+            ${{r.media_urls && r.media_urls.length ? `<div class="media-grid">${{r.media_urls.map(m => `<img class="media-thumb" src="${{m}}" loading="lazy">`).join('')}}</div>` : ''}}
+            <div style="margin-top:0.75rem">${{(r.tags || []).map(t => `<span class="tag" onclick="filterTag('${{t}}')">${{t}}</span>`).join(' ')}}</div>
+          </div>
+        `).join('');
+
+        container.insertAdjacentHTML('beforeend', html);
+        currentOffset += results.length;
+      }} finally {{
+        isLoading = false;
+      }}
+    }}
+
+    function filterTag(tag) {{
+      document.querySelectorAll('.tag').forEach(el => el.classList.remove('active'));
+      const activeEl = document.getElementById('tag-' + tag);
+      if (activeEl) activeEl.classList.add('active');
+      document.getElementById('btn-clear-filter').style.display = 'inline-block';
+      currentTag = tag;
+      document.getElementById('query').value = '';
+      currentQuery = '';
+      loadLikes(false);
+    }}
+
+    function clearFilters() {{
+      document.querySelectorAll('.tag').forEach(el => el.classList.remove('active'));
+      document.getElementById('btn-clear-filter').style.display = 'none';
+      currentTag = null;
+      document.getElementById('query').value = '';
+      currentQuery = '';
+      loadLikes(false);
+    }}
+
+    function triggerNewSearch() {{
+      currentQuery = document.getElementById('query').value;
+      loadLikes(false);
+    }}
+
+    // Lazy load on scroll near bottom
+    const observer = new IntersectionObserver((entries) => {{
+      if (entries[0].isIntersecting && hasMore && !isLoading) {{
+        loadLikes(true);
+      }}
+    }}, {{ rootMargin: '300px' }});
+    observer.observe(document.getElementById('scroll-sentinel'));
+
+    // Initial load
+    window.addEventListener('DOMContentLoaded', () => loadLikes(false));
+
     function openAuthModal() {{ document.getElementById('auth-modal').style.display = 'flex'; }}
     function closeAuthModal() {{ document.getElementById('auth-modal').style.display = 'none'; }}
     function openHistoryModal() {{ document.getElementById('history-modal').style.display = 'flex'; loadHistoryLogs(); loadNotifications(); }}
