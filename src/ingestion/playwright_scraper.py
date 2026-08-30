@@ -138,6 +138,7 @@ class PlaywrightXScraper:
         username: str = "",
         max_tweets: int = 0,
         on_progress: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        on_item_found: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> list[dict[str, Any]]:
         self._ensure_restored()
         target = self.session_path if self.session_path.exists() else self.backup_path
@@ -212,7 +213,7 @@ class PlaywrightXScraper:
                                 media_urls.append(src)
 
                         seen_ids.add(tweet_id)
-                        extracted_tweets.append({
+                        tweet_obj = {
                             "id": tweet_id,
                             "tweet_id": tweet_id,
                             "author_name": author_name,
@@ -225,7 +226,13 @@ class PlaywrightXScraper:
                             "local_media_paths": [],
                             "tags": [],
                             "raw_json": json.dumps({"id": tweet_id, "text": tweet_text, "user": user_text}),
-                        })
+                        }
+                        extracted_tweets.append(tweet_obj)
+
+                        # Immediately process and save to LanceDB on-the-fly!
+                        if on_item_found:
+                            await on_item_found(tweet_obj)
+
                         if max_tweets > 0 and len(extracted_tweets) >= max_tweets:
                             break
                     except Exception:

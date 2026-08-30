@@ -84,15 +84,13 @@ class BackgroundSyncScheduler:
         self.is_running = True
         inserted_count = 0
         try:
-            # Query existing IDs to avoid re-visiting/re-processing
             existing_tweets = self.store.get_all_tweets(limit=100000)
             existing_ids = {t["tweet_id"] for t in existing_tweets if t.get("tweet_id")}
 
-            # Uncapped infinite scroll (max_tweets=0) until reaching the end of timeline
-            scraped = await self.scraper.scrape_likes(max_tweets=0)
-            new_tweets = [t for t in scraped if t.get("id") not in existing_ids]
-
-            for tweet in new_tweets:
+            async def on_item_found(tweet: dict):
+                nonlocal inserted_count
+                if tweet.get("id") in existing_ids:
+                    return
                 tweet["local_media_paths"] = self.downloader.download_tweet_media(tweet)
                 tweet["tags"] = self.tagger.generate_tags(tweet["text"])
                 try:
@@ -101,7 +99,10 @@ class BackgroundSyncScheduler:
                     tweet["vector"] = [0.0] * 1024
                 
                 self.store.upsert_tweets([tweet])
+                existing_ids.add(tweet.get("id"))
                 inserted_count += 1
+
+            await self.scraper.scrape_likes(max_tweets=0, on_item_found=on_item_found)
 
             self.last_sync_time = time.time()
             self.total_synced_count += inserted_count
