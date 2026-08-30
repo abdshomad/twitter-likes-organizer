@@ -12,6 +12,7 @@ from src.storage.history_manager import HistoryManager
 from src.media.media_queue import MediaQueue
 from src.ai.tagger import AITagger
 from src.ai.embedder import VectorEmbedder
+from src.ai.rag_chat import RAGChatEngine
 from src.exporter.markdown_exporter import export_tweets_to_directory
 from src.ingestion.archive_parser import parse_like_js_content
 from src.ingestion.playwright_scraper import PlaywrightXScraper
@@ -26,6 +27,7 @@ store = LanceDBStore()
 history = HistoryManager()
 tagger = AITagger()
 embedder = VectorEmbedder()
+rag_chat = RAGChatEngine(store=store, embedder=embedder)
 media_queue = MediaQueue(store=store)
 scraper = PlaywrightXScraper()
 unliker = TwitterUnliker(scraper.session_path)
@@ -57,6 +59,7 @@ async def lifespan(app: FastAPI):
     queue_task.cancel()
     author_task.cancel()
     await author_hydrator.close()
+    await rag_chat.close()
 
 
 app = FastAPI(title="𝕏 Likes Organizer HUD", version="0.2.0", lifespan=lifespan)
@@ -165,6 +168,14 @@ async def sync_stream(max_tweets: int = 0, username: str = ""):
     auto_unlike = sched_status.get("auto_unlike", True)
     return StreamingResponse(
         stream_likes_sync(scraper, store, tagger, embedder, media_queue, username, max_tweets, auto_unlike),
+        media_type="text/event-stream",
+    )
+
+
+@app.get("/api/chat/stream")
+async def chat_stream(q: str = Query(..., description="User chat query to LanceDB")):
+    return StreamingResponse(
+        rag_chat.stream_chat_response(query=q),
         media_type="text/event-stream",
     )
 
@@ -342,6 +353,18 @@ async def index():
     .hud-tab {{ padding: 8px 12px; cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent; font-size: 0.85rem; font-weight: 600; }}
     .hud-tab.active {{ color: var(--primary); border-bottom-color: var(--primary); }}
     .hud-sidesheet-content {{ flex: 1; overflow-y: auto; padding: 16px; font-size: 0.85rem; }}
+
+    /* Sliding HUD RAG Chat Drawer */
+    .hud-chat-drawer {{ position: fixed; top: 76px; bottom: 16px; left: 16px; width: 460px; background: rgba(11, 15, 25, 0.94); backdrop-filter: blur(22px); -webkit-backdrop-filter: blur(22px); border: 1px solid rgba(99, 102, 241, 0.35); border-radius: 16px; z-index: 120; display: flex; flex-direction: column; box-shadow: 10px 0 40px rgba(0, 0, 0, 0.75); transform: translateX(-500px); transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1); }}
+    .hud-chat-drawer.open {{ transform: translateX(0); }}
+    .chat-messages {{ flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; font-size: 0.85rem; }}
+    .chat-msg {{ padding: 10px 14px; border-radius: 10px; line-height: 1.4; max-width: 90%; }}
+    .chat-msg.user {{ align-self: flex-end; background: linear-gradient(135deg, #1d9bf0, #4f46e5); color: #fff; border-bottom-right-radius: 2px; }}
+    .chat-msg.assistant {{ align-self: flex-start; background: rgba(255, 255, 255, 0.05); border: 1px solid var(--card-border); color: var(--text); border-bottom-left-radius: 2px; }}
+    .chat-source-card {{ font-size: 0.75rem; background: rgba(0, 0, 0, 0.4); border: 1px solid var(--card-border); padding: 6px 10px; border-radius: 6px; margin-top: 6px; }}
+    .chat-chip {{ font-size: 0.72rem; background: rgba(99, 102, 241, 0.15); color: #a5b4fc; border: 1px solid rgba(99, 102, 241, 0.3); padding: 4px 8px; border-radius: 6px; cursor: pointer; display: inline-block; transition: all 0.15s; }}
+    .chat-chip:hover {{ background: rgba(99, 102, 241, 0.3); border-color: rgba(99, 102, 241, 0.6); }}
+    .chat-input-row {{ padding: 12px 16px; border-top: 1px solid var(--card-border); display: flex; gap: 8px; background: rgba(8, 11, 18, 0.8); border-radius: 0 0 16px 16px; }}
     
     /* Non-blocking Floating Sync Toast */
     .hud-floating-toast {{ position: fixed; bottom: 1.5rem; right: 1.5rem; background: rgba(11, 15, 25, 0.95); backdrop-filter: blur(16px); border: 1px solid rgba(29, 155, 240, 0.4); box-shadow: 0 10px 30px rgba(0,0,0,0.8); border-radius: 12px; width: 340px; z-index: 95; display: none; overflow: hidden; font-size: 0.85rem; }}
@@ -379,6 +402,11 @@ async def index():
 
     <!-- Pure HUD SVG Icon Deck -->
     <div class="hud-deck">
+      <!-- Chat with LanceDB RAG Button -->
+      <button id="btn-chat-icon" class="hud-icon-btn accent" onclick="toggleChatDrawer()" title="Chat with LanceDB (AI RAG)">
+        <svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      </button>
+
       <!-- Auto-Sync Toggle Icon Button -->
       <button id="btn-auto-sync-icon" class="hud-icon-btn {'active' if sched['enabled'] else ''}" onclick="toggleAutoSync()" title="Toggle Auto-Sync ({'ON' if sched['enabled'] else 'OFF'})">
         <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
@@ -493,6 +521,37 @@ async def index():
     <div id="results" class="cols-2 mode-card"></div>
     <div id="scroll-sentinel" style="height:20px; margin-top:1rem;"></div>
   </div>
+
+  <!-- HUD RAG Chat Drawer -->
+  <aside class="hud-chat-drawer" id="hud-chat-drawer">
+    <div class="hud-sidesheet-header">
+      <div style="display:flex; align-items:center; gap:8px;">
+        <span style="font-size:1.1rem;">💬</span>
+        <h3 style="font-size:0.95rem; font-weight:700;">Chat with LanceDB</h3>
+        <span class="hud-badge connected" style="font-size:0.65rem; padding:2px 6px;">RAG ACTIVE</span>
+      </div>
+      <button class="hud-icon-btn" onclick="toggleChatDrawer()" style="width:28px; height:28px;">✕</button>
+    </div>
+
+    <!-- Chat Messages Feed -->
+    <div class="chat-messages" id="chat-messages-container">
+      <div class="chat-msg assistant">
+        <strong>👋 Assistant</strong><br>
+        Ask anything across your 3,300+ likes! I search your local LanceDB vectors and synthesize answers with citations.
+        <div style="display:flex; flex-wrap:wrap; gap:6px; margin-top:10px;">
+          <span class="chat-chip" onclick="askPreset('What did Karpathy or DHH tweet about AI agents and code?')">🤖 Karpathy on AI Agents</span>
+          <span class="chat-chip" onclick="askPreset('Summarize the top frontend and UI libraries I liked')">🎨 Top UI Libraries</span>
+          <span class="chat-chip" onclick="askPreset('Find interesting Python developer tools and tips')">🐍 Python Tools</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Chat Input Form -->
+    <div class="chat-input-row">
+      <input type="text" id="chat-input" class="hud-input" placeholder="Ask a question about your likes..." onkeyup="if(event.key==='Enter') sendChatMessage()" style="background:#080b12;">
+      <button class="hud-btn accent" onclick="sendChatMessage()" id="btn-chat-send" style="padding:0.5rem 1rem;">Send</button>
+    </div>
+  </aside>
 
   <!-- HUD Right Sidesheet -->
   <aside class="hud-sidesheet" id="hud-sidesheet">
@@ -681,11 +740,12 @@ async def index():
           ? r.local_media_paths.map(p => `/media/${{p.split('/').pop()}}`)
           : (r.media_urls || []);
         const fallbackSrc = (r.media_urls && r.media_urls.length) ? r.media_urls[0] : '';
+        const authorDisplay = r.author_handle ? (r.author_handle.startsWith('@') ? r.author_handle : '@' + r.author_handle) : 'Post #' + r.tweet_id;
 
         if (displayMode === 'list') {{
           return `
             <div class="compact-row">
-              <span style="font-weight:600; color:var(--primary); min-width:120px; font-family:'JetBrains Mono',monospace;">@${{r.author_handle || 'user'}}</span>
+              <span style="font-weight:600; color:var(--primary); min-width:120px; font-family:'JetBrains Mono',monospace;">${{authorDisplay}}</span>
               <span class="compact-text">${{r.text}}</span>
               <div style="display:flex; gap:0.25rem;">${{(r.tags || []).slice(0, 2).map(t => `<span class="hud-tag" style="font-size:0.7rem; padding:0.1rem 0.4rem;" onclick="filterTag('${{t}}')">${{t}}</span>`).join('')}}</div>
               <a href="${{r.url}}" target="_blank" style="color:var(--muted); font-size:0.75rem;">Link</a>
@@ -698,7 +758,7 @@ async def index():
             <div class="gallery-card">
               ${{mediaSrc ? `<img class="gallery-img" src="${{mediaSrc}}" onerror="this.src='${{fallbackSrc}}'" loading="lazy">` : '<div style=\"height:120px; background:#131926; display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:0.8rem;\">Text Post</div>'}}
               <div class="gallery-body">
-                <div class="tweet-header"><span><strong>${{r.author_name || 'User'}}</strong></span><a href="${{r.url}}" target="_blank" style="color:var(--primary)">View</a></div>
+                <div class="tweet-header"><span><strong>${{r.author_name || authorDisplay}}</strong></span><a href="${{r.url}}" target="_blank" style="color:var(--primary)">View</a></div>
                 <p style="font-size:0.82rem; line-height:1.3; margin-bottom:0.5rem; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden;">${{r.text}}</p>
                 <div>${{(r.tags || []).slice(0, 3).map(t => `<span class="hud-tag" style="font-size:0.7rem; padding:0.1rem 0.4rem;" onclick="filterTag('${{t}}')">${{t}}</span>`).join(' ')}}</div>
               </div>
@@ -708,7 +768,7 @@ async def index():
         return `
           <div class="hud-tweet-card">
             <div>
-              <div class="tweet-header"><span><strong>${{r.author_name || 'User'}}</strong> <span style="color:var(--muted); font-family:'JetBrains Mono',monospace;">@${{r.author_handle || 'user'}}</span></span><a href="${{r.url}}" target="_blank" style="color:var(--primary)">View</a></div>
+              <div class="tweet-header"><span><strong>${{r.author_name || authorDisplay}}</strong> <span style="color:var(--muted); font-family:'JetBrains Mono',monospace;">${{authorDisplay}}</span></span><a href="${{r.url}}" target="_blank" style="color:var(--primary)">View</a></div>
               <p style="white-space:pre-wrap; line-height:1.4; font-size:0.9rem;">${{r.text}}</p>
               ${{mediaList.length ? `<div class="media-grid">${{mediaList.map((m, idx) => `<img class="media-thumb" src="${{m}}" onerror="this.src='${{fallbackSrc}}'" loading="lazy">`).join('')}}</div>` : ''}}
             </div>
@@ -794,6 +854,70 @@ async def index():
         const tHtml = (tagsData.tags || []).slice(0, 30).map(t => `<span class='hud-tag ${{t.tag === currentTag ? 'active' : ''}}' id='tag-${{t.tag}}' onclick='filterTag("${{t.tag}}")'>${{t.tag}} <span class='tag-count'>${{t.count}}</span></span>`).join('');
         document.getElementById('tag-cloud-container').innerHTML = tHtml;
       }} catch (e) {{}}
+    }}
+
+    /* RAG Chat Drawer Logic */
+    function toggleChatDrawer() {{
+      const drawer = document.getElementById('hud-chat-drawer');
+      drawer.classList.toggle('open');
+      if (drawer.classList.contains('open')) {{
+        document.getElementById('chat-input').focus();
+      }}
+    }}
+
+    function askPreset(promptText) {{
+      document.getElementById('chat-input').value = promptText;
+      sendChatMessage();
+    }}
+
+    function sendChatMessage() {{
+      const input = document.getElementById('chat-input');
+      const q = input.value.trim();
+      if (!q) return;
+      input.value = '';
+
+      const container = document.getElementById('chat-messages-container');
+      container.innerHTML += `<div class="chat-msg user">${{q}}</div>`;
+      
+      const responseId = 'ai-resp-' + Date.now();
+      container.innerHTML += `
+        <div class="chat-msg assistant" id="${{responseId}}">
+          <div style="display:flex; align-items:center; gap:6px; color:var(--primary); font-weight:600; margin-bottom:4px;">
+            <span>🧠 Searching LanceDB...</span>
+          </div>
+          <div class="ai-text" style="white-space:pre-wrap;"></div>
+          <div class="ai-sources" style="margin-top:8px;"></div>
+        </div>
+      `;
+      container.scrollTop = container.scrollHeight;
+
+      const aiMsgEl = document.getElementById(responseId);
+      const textEl = aiMsgEl.querySelector('.ai-text');
+      const sourcesEl = aiMsgEl.querySelector('.ai-sources');
+
+      const es = new EventSource(`/api/chat/stream?q=${{encodeURIComponent(q)}}`);
+      es.onmessage = function(e) {{
+        const data = JSON.parse(e.data);
+        if (data.type === 'sources') {{
+          const sources = data.sources || [];
+          if (sources.length > 0) {{
+            sourcesEl.innerHTML = '<strong style="color:var(--muted); font-size:0.75rem;">Cited Likes:</strong>' + sources.map(s => `
+              <div class="chat-source-card">
+                <strong>[${{s.index}}] @${{s.author_handle}}</strong>: ${{s.text.slice(0, 70)}}...
+                <a href="${{s.url}}" target="_blank" style="color:var(--primary); margin-left:4px;">[View]</a>
+              </div>
+            `).join('');
+          }}
+        }} else if (data.type === 'token') {{
+          textEl.textContent += data.token;
+          container.scrollTop = container.scrollHeight;
+        }} else if (data.type === 'done') {{
+          es.close();
+        }}
+      }};
+      es.onerror = function() {{
+        es.close();
+      }};
     }}
 
     function startSyncStream() {{
@@ -969,7 +1093,6 @@ async def index():
       alert(`Exported ${{data.exported_count}} tweets to ${{data.export_dir}}!`);
     }}
 
-    // Background Prefetch for Top 6 Tags
     function prefetchTopTags() {{
       const topTags = Array.from(document.querySelectorAll('.hud-tag')).slice(0, 6).map(el => el.id.replace('tag-', ''));
       topTags.forEach(tag => {{

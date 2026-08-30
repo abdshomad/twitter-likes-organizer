@@ -1,7 +1,7 @@
 from typing import Sequence
 from fastembed import TextEmbedding
 
-DEFAULT_MODEL = "BAAI/bge-m3"
+DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 
 
 class VectorEmbedder:
@@ -17,7 +17,7 @@ class VectorEmbedder:
 
     def embed_text(self, text: str) -> list[float]:
         if not text.strip():
-            return [0.0] * 1024
+            return [0.0] * 384
         embeddings = list(self.model.embed([text]))
         return embeddings[0].tolist()
 
