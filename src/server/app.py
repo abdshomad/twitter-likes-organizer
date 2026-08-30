@@ -76,6 +76,13 @@ async def scheduler_toggle():
     return {"enabled": state, "status": scheduler.get_status()}
 
 
+@app.post("/api/scheduler/interval")
+async def scheduler_interval(payload: dict[str, Any] = Body(...)):
+    sec = int(payload.get("interval_sec", 600))
+    scheduler.set_interval(sec)
+    return {"status": "success", "scheduler": scheduler.get_status()}
+
+
 @app.post("/api/settings/auto-unlike/toggle")
 async def toggle_auto_unlike():
     state = scheduler.toggle_auto_unlike()
@@ -203,6 +210,8 @@ async def index():
     .dot {{ width: 8px; height: 8px; border-radius: 50%; display: inline-block; }}
     .dot.connected {{ background: var(--success); box-shadow: 0 0 8px var(--success); }}
     .dot.disconnected {{ background: #ef4444; }}
+    .sync-pill {{ display: flex; align-items: center; gap: 0.5rem; background: var(--card); border: 1px solid var(--border); padding: 0.4rem 0.75rem; border-radius: 8px; font-size: 0.85rem; }}
+    .sync-select {{ background: #1a202c; color: var(--text); border: 1px solid var(--border); padding: 0.25rem 0.5rem; border-radius: 4px; font-size: 0.8rem; }}
     .grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 1.5rem; }}
     .card {{ background: var(--card); border: 1px solid var(--border); padding: 1.25rem; border-radius: 8px; }}
     .card h4 {{ color: var(--muted); font-size: 0.8rem; text-transform: uppercase; }}
@@ -265,8 +274,22 @@ async def index():
           <span>{f'Connected @{auth["username"]}' if auth['connected'] and auth['username'] else ('Connected' if auth['connected'] else 'Not Connected')}</span>
           <button class="secondary" onclick="openAuthModal()" style="padding:0.25rem 0.5rem; font-size:0.75rem;">{ 'Manage' if auth['connected'] else 'Connect' }</button>
         </div>
+
+        <div class="sync-pill">
+          <button id="btn-auto-sync" class="{'secondary' if not sched['enabled'] else ''}" style="padding:0.25rem 0.6rem; font-size:0.75rem;" onclick="toggleAutoSync()">
+            {'Sync: ON' if sched['enabled'] else 'Sync: OFF'}
+          </button>
+          <select id="select-interval" class="sync-select" onchange="changeSyncInterval(this.value)">
+            <option value="300" {'selected' if sched['interval_sec'] == 300 else ''}>5m</option>
+            <option value="600" {'selected' if sched['interval_sec'] == 600 else ''}>10m</option>
+            <option value="1800" {'selected' if sched['interval_sec'] == 1800 else ''}>30m</option>
+            <option value="3600" {'selected' if sched['interval_sec'] == 3600 else ''}>1h</option>
+            <option value="0" {'selected' if sched['interval_sec'] == 0 else ''}>Manual</option>
+          </select>
+          <span id="sync-countdown" style="font-size:0.75rem; color:var(--muted); min-width:65px;">Next: --:--</span>
+        </div>
+
         <button id="btn-auto-unlike" class="secondary" onclick="toggleAutoUnlike()">{'Auto-Unlike: ON' if sched.get('auto_unlike') else 'Auto-Unlike: OFF'}</button>
-        <button id="btn-auto-sync" class="secondary" onclick="toggleAutoSync()">{'Auto-Sync: ON' if sched['enabled'] else 'Auto-Sync: OFF'}</button>
         <button id="btn-sync" onclick="startSyncStream()">Sync Now</button>
         <button class="secondary" onclick="openHistoryModal()">
           Logs & Alerts {f'<span class="badge" id="unread-badge">{unread}</span>' if unread > 0 else '<span id="unread-badge"></span>'}
@@ -286,7 +309,7 @@ async def index():
         <div id="progress-fill" class="progress-bar-fill"></div>
       </div>
       <div id="feed-terminal" class="feed-terminal">
-        <div>[Ready] Decoupled 2-stage pipeline with instant lazy-loaded multi-column browsing.</div>
+        <div>[Ready] Decoupled 2-stage pipeline with unified Sync ON/OFF controls.</div>
       </div>
     </div>
 
@@ -382,6 +405,9 @@ async def index():
     let isLoading = false;
     let hasMore = true;
     let viewMode = localStorage.getItem('likes_view_mode') || '2col';
+    let nextSyncSeconds = {sched.get('next_sync_in_sec', 0)};
+    let isSyncEnabled = {str(sched.get('enabled', True)).lower()};
+    let syncInterval = {sched.get('interval_sec', 600)};
     const PAGE_LIMIT = 18;
 
     function setViewMode(mode) {{
@@ -489,6 +515,44 @@ async def index():
     }}, {{ rootMargin: '300px' }});
     observer.observe(document.getElementById('scroll-sentinel'));
 
+    // Countdown timer ticker
+    setInterval(() => {{
+      const cd = document.getElementById('sync-countdown');
+      if (!isSyncEnabled || syncInterval === 0) {{
+        cd.innerText = isSyncEnabled ? 'Manual' : 'Paused';
+        return;
+      }}
+      if (nextSyncSeconds > 0) nextSyncSeconds--;
+      const m = Math.floor(nextSyncSeconds / 60);
+      const s = nextSyncSeconds % 60;
+      cd.innerText = `Next: ${{m.toString().padStart(2, '0')}}:${{s.toString().padStart(2, '0')}}`;
+      if (nextSyncSeconds === 0) {{
+        nextSyncSeconds = syncInterval;
+      }}
+    }}, 1000);
+
+    async function toggleAutoSync() {{
+      const res = await fetch('/api/scheduler/toggle', {{ method: 'POST' }});
+      const data = await res.json();
+      isSyncEnabled = data.enabled;
+      nextSyncSeconds = data.status.next_sync_in_sec || syncInterval;
+      const btn = document.getElementById('btn-auto-sync');
+      btn.innerText = isSyncEnabled ? 'Sync: ON' : 'Sync: OFF';
+      btn.className = isSyncEnabled ? '' : 'secondary';
+    }}
+
+    async function changeSyncInterval(val) {{
+      const sec = parseInt(val);
+      syncInterval = sec;
+      const res = await fetch('/api/scheduler/interval', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ interval_sec: sec }})
+      }});
+      const data = await res.json();
+      nextSyncSeconds = data.scheduler.next_sync_in_sec || sec;
+    }}
+
     window.addEventListener('DOMContentLoaded', () => {{
       setViewMode(viewMode);
     }});
@@ -563,12 +627,6 @@ async def index():
       await fetch('/api/history/notifications/read-all', {{ method: 'POST' }});
       document.getElementById('unread-badge').innerText = '';
       loadNotifications();
-    }}
-
-    async function toggleAutoSync() {{
-      const res = await fetch('/api/scheduler/toggle', {{ method: 'POST' }});
-      const data = await res.json();
-      document.getElementById('btn-auto-sync').innerText = data.enabled ? 'Auto-Sync: ON' : 'Auto-Sync: OFF';
     }}
 
     async function toggleAutoUnlike() {{

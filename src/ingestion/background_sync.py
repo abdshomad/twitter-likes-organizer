@@ -49,6 +49,7 @@ class BackgroundSyncScheduler:
                 data = json.loads(SYNC_STATE_PATH.read_text())
                 self.enabled = data.get("enabled", True)
                 self.auto_unlike = data.get("auto_unlike", True)
+                self.interval_sec = data.get("interval_sec", self.interval_sec)
                 self.last_sync_time = data.get("last_sync_time", 0)
                 self.total_synced_count = data.get("total_synced_count", 0)
             except Exception:
@@ -70,7 +71,7 @@ class BackgroundSyncScheduler:
     def get_status(self) -> dict[str, Any]:
         now = time.time()
         elapsed = now - self.last_sync_time if self.last_sync_time > 0 else self.interval_sec
-        next_in = max(0, int(self.interval_sec - elapsed)) if self.enabled else 0
+        next_in = max(0, int(self.interval_sec - elapsed)) if (self.enabled and self.interval_sec > 0) else 0
         return {
             "enabled": self.enabled,
             "auto_unlike": self.auto_unlike,
@@ -85,6 +86,11 @@ class BackgroundSyncScheduler:
         self.enabled = not self.enabled if enable is None else enable
         self._save_state()
         return self.enabled
+
+    def set_interval(self, interval_sec: int) -> int:
+        self.interval_sec = max(0, interval_sec)
+        self._save_state()
+        return self.interval_sec
 
     def toggle_auto_unlike(self, enable: bool | None = None) -> bool:
         self.auto_unlike = not self.auto_unlike if enable is None else enable
@@ -172,12 +178,12 @@ class BackgroundSyncScheduler:
     async def start_loop(self):
         while True:
             try:
-                await asyncio.sleep(10)
-                if self.enabled:
+                await asyncio.sleep(5)
+                if self.enabled and self.interval_sec > 0:
                     now = time.time()
                     if (now - self.last_sync_time) >= self.interval_sec:
                         await self.run_sync_cycle()
             except asyncio.CancelledError:
                 break
             except Exception:
-                await asyncio.sleep(10)
+                await asyncio.sleep(5)
