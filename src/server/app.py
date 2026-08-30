@@ -27,7 +27,7 @@ embedder = VectorEmbedder()
 media_queue = MediaQueue(store=store)
 scraper = PlaywrightXScraper()
 unliker = TwitterUnliker(scraper.session_path)
-scheduler = BackgroundSyncScheduler(scraper, store, tagger, embedder, media_queue, interval_sec=600)
+scheduler = BackgroundSyncScheduler(scraper, store, tagger, embedder, media_queue, interval_sec=300)
 
 
 @asynccontextmanager

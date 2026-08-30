@@ -24,7 +24,7 @@ class BackgroundSyncScheduler:
         tagger: AITagger,
         embedder: VectorEmbedder,
         media_queue: MediaQueue,
-        interval_sec: int = 600,
+        interval_sec: int = 300,
     ):
         self.scraper = scraper
         self.gql_client = TwitterGraphQLClient(scraper.session_path)
@@ -40,7 +40,7 @@ class BackgroundSyncScheduler:
         self.is_running = False
         self.last_sync_time: float = 0
         self.total_synced_count: int = 0
-        self.task: asyncio.Task | None = None
+        self.last_spared_tweet_id: str = ""
         self._load_state()
 
     def _load_state(self):
@@ -52,6 +52,7 @@ class BackgroundSyncScheduler:
                 self.interval_sec = data.get("interval_sec", self.interval_sec)
                 self.last_sync_time = data.get("last_sync_time", 0)
                 self.total_synced_count = data.get("total_synced_count", 0)
+                self.last_spared_tweet_id = data.get("last_spared_tweet_id", "")
             except Exception:
                 pass
         else:
@@ -65,6 +66,7 @@ class BackgroundSyncScheduler:
             "last_sync_time": self.last_sync_time,
             "total_synced_count": self.total_synced_count,
             "interval_sec": self.interval_sec,
+            "last_spared_tweet_id": self.last_spared_tweet_id,
         }
         SYNC_STATE_PATH.write_text(json.dumps(data, indent=2))
 
@@ -80,6 +82,7 @@ class BackgroundSyncScheduler:
             "next_sync_in_sec": next_in,
             "last_sync_time": self.last_sync_time,
             "total_synced_count": self.total_synced_count,
+            "last_spared_tweet_id": self.last_spared_tweet_id,
         }
 
     def toggle(self, enable: bool | None = None) -> bool:
@@ -106,36 +109,40 @@ class BackgroundSyncScheduler:
 
         self.is_running = True
         inserted_count = 0
+        unliked_count = 0
         start_time = time.time()
+        max_duration_sec = max(60, self.interval_sec - 60)
         engine_used = "graphql"
 
         try:
             existing_tweets = self.store.get_all_tweets(limit=100000)
             existing_ids = {t["tweet_id"] for t in existing_tweets if t.get("tweet_id")}
 
+            discovered_batch: list[dict[str, Any]] = []
+
             async def on_item_found(tweet: dict):
                 nonlocal inserted_count
-                if tweet.get("id") in existing_ids:
+                # Check time cutoff: stop extracting 1 min before next batch
+                if (time.time() - start_time) >= max_duration_sec:
                     return
-                media_urls = tweet.get("media_urls", [])
-                if media_urls:
-                    await self.media_queue.enqueue(tweet.get("id", ""), media_urls)
 
-                tweet["tags"] = self.tagger.generate_tags(tweet["text"])
-                try:
-                    tweet["vector"] = self.embedder.embed_text(tweet["text"])
-                except Exception:
-                    tweet["vector"] = [0.0] * 1024
-                
-                self.store.upsert_tweets([tweet])
-                existing_ids.add(tweet.get("id"))
-                inserted_count += 1
+                tid = str(tweet.get("id") or tweet.get("tweet_id"))
+                discovered_batch.append(tweet)
 
-                if self.auto_unlike:
+                if tid not in existing_ids:
+                    media_urls = tweet.get("media_urls", [])
+                    if media_urls:
+                        await self.media_queue.enqueue(tid, media_urls)
+
+                    tweet["tags"] = self.tagger.generate_tags(tweet.get("text", ""))
                     try:
-                        await self.unliker.ensure_unliked(tweet.get("id", ""), tweet.get("url", ""), max_attempts=3)
+                        tweet["vector"] = self.embedder.embed_text(tweet.get("text", ""))
                     except Exception:
-                        pass
+                        tweet["vector"] = [0.0] * 1024
+
+                    self.store.upsert_tweets([tweet])
+                    existing_ids.add(tid)
+                    inserted_count += 1
 
             uname = status.get("username", "")
             try:
@@ -144,6 +151,32 @@ class BackgroundSyncScheduler:
                 engine_used = "playwright"
                 await self.scraper.scrape_likes(username=uname, max_tweets=0, on_item_found=on_item_found)
 
+            # Rolling 1-Like Buffer: Spare the #1 latest like on X, unlike older likes
+            if self.auto_unlike and discovered_batch:
+                # If we had a previous spared tweet and a newer one was found, unlike the previous one now
+                new_spared_id = str(discovered_batch[0].get("id") or discovered_batch[0].get("tweet_id"))
+                if self.last_spared_tweet_id and self.last_spared_tweet_id != new_spared_id:
+                    try:
+                        await self.unliker.ensure_unliked(self.last_spared_tweet_id, max_attempts=3)
+                        unliked_count += 1
+                    except Exception:
+                        pass
+
+                # Unlike items starting from index 1 (sparing index 0 as rolling anchor)
+                for t in discovered_batch[1:]:
+                    if (time.time() - start_time) >= max_duration_sec:
+                        break
+                    tid = str(t.get("id") or t.get("tweet_id"))
+                    try:
+                        success, _ = await self.unliker.ensure_unliked(tid, max_attempts=3)
+                        if success:
+                            unliked_count += 1
+                        await asyncio.sleep(0.6)
+                    except Exception:
+                        pass
+
+                self.last_spared_tweet_id = new_spared_id
+
             self.last_sync_time = time.time()
             self.total_synced_count += inserted_count
             self._save_state()
@@ -151,19 +184,19 @@ class BackgroundSyncScheduler:
             duration = time.time() - start_time
             total_db = self.store.get_stats().get("total_likes", 0)
             self.history.add_sync_log(
-                trigger="auto-cron",
+                trigger="auto-cron-5m",
                 engine=engine_used,
                 status="success",
                 new_likes=inserted_count,
                 total_db_likes=total_db,
-                message=f"Auto-sync completed (+{inserted_count} likes, Auto-Unlike: {self.auto_unlike}).",
+                message=f"Sync cycle completed (+{inserted_count} saved, {unliked_count} unliked, 1 spared anchor).",
                 duration_sec=duration,
             )
         except Exception as e:
             duration = time.time() - start_time
             total_db = self.store.get_stats().get("total_likes", 0)
             self.history.add_sync_log(
-                trigger="auto-cron",
+                trigger="auto-cron-5m",
                 engine=engine_used,
                 status="error",
                 new_likes=inserted_count,
