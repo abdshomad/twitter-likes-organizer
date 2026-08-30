@@ -221,11 +221,12 @@ async def index():
     body {{ font-family: 'Inter', system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); padding-top: 80px; min-height: 100vh; overflow-x: hidden; }}
     .container {{ max-width: 1400px; margin: 0 auto; padding: 0 1.5rem 3rem; }}
     
-    /* HUD Floating Topbar */
+    /* Pure HUD Floating Topbar */
     .hud-topbar {{ position: fixed; top: 12px; left: 16px; right: 16px; height: 56px; background: rgba(11, 15, 25, 0.85); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 12px; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; z-index: 100; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6); }}
     .hud-brand {{ display: flex; align-items: center; gap: 8px; font-weight: 800; font-size: 1rem; color: #fff; text-decoration: none; }}
     .hud-brand span {{ background: linear-gradient(135deg, #1d9bf0, #818cf8); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }}
-    .hud-badge {{ font-size: 0.75rem; padding: 3px 8px; border-radius: 6px; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; font-family: 'JetBrains Mono', monospace; }}
+    
+    .hud-badge {{ font-size: 0.75rem; padding: 3px 8px; border-radius: 6px; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; font-family: 'JetBrains Mono', monospace; cursor: pointer; }}
     .hud-badge.connected {{ background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.35); }}
     .hud-badge.disconnected {{ background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.35); }}
     .dot {{ width: 7px; height: 7px; border-radius: 50%; display: inline-block; }}
@@ -237,21 +238,28 @@ async def index():
     .ticker-item {{ color: var(--muted); }}
     .ticker-item strong {{ color: var(--text); }}
     
-    /* HUD Buttons & Controls */
-    .hud-btn {{ background: rgba(255, 255, 255, 0.06); color: var(--text); border: 1px solid var(--card-border); padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; font-size: 0.8rem; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; transition: all 0.2s ease; }}
-    .hud-btn:hover {{ background: rgba(255, 255, 255, 0.12); border-color: rgba(255, 255, 255, 0.2); }}
-    .hud-btn.accent {{ background: linear-gradient(135deg, rgba(29, 155, 240, 0.3), rgba(99, 102, 241, 0.3)); border-color: rgba(29, 155, 240, 0.5); color: #fff; box-shadow: 0 0 12px rgba(29, 155, 240, 0.2); }}
-    .hud-btn.accent:hover {{ background: linear-gradient(135deg, rgba(29, 155, 240, 0.5), rgba(99, 102, 241, 0.5)); }}
-    .sync-pill {{ display: flex; align-items: center; gap: 6px; background: rgba(0, 0, 0, 0.4); border: 1px solid var(--card-border); padding: 3px 8px; border-radius: 8px; font-size: 0.75rem; font-family: 'JetBrains Mono', monospace; }}
-    .sync-select, .sort-select {{ background: #131926; color: var(--text); border: 1px solid var(--card-border); padding: 0.3rem 0.6rem; border-radius: 6px; font-size: 0.8rem; outline: none; }}
+    /* Standardized Pure HUD Icon Deck */
+    .hud-deck {{ display: flex; align-items: center; gap: 6px; }}
+    .hud-icon-btn {{ position: relative; width: 36px; height: 36px; background: rgba(255, 255, 255, 0.05); color: var(--muted); border: 1px solid var(--card-border); border-radius: 8px; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: all 0.2s ease; outline: none; }}
+    .hud-icon-btn svg {{ width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }}
+    .hud-icon-btn:hover {{ background: rgba(255, 255, 255, 0.12); color: #fff; border-color: rgba(255, 255, 255, 0.25); transform: translateY(-1px); }}
+    .hud-icon-btn.active {{ background: rgba(29, 155, 240, 0.2); color: var(--primary); border-color: rgba(29, 155, 240, 0.5); box-shadow: 0 0 10px rgba(29, 155, 240, 0.3); }}
+    .hud-icon-btn.accent {{ background: linear-gradient(135deg, rgba(29, 155, 240, 0.3), rgba(99, 102, 241, 0.3)); border-color: rgba(29, 155, 240, 0.6); color: #fff; box-shadow: 0 0 12px rgba(29, 155, 240, 0.3); }}
+    .hud-icon-btn.accent:hover {{ background: linear-gradient(135deg, rgba(29, 155, 240, 0.5), rgba(99, 102, 241, 0.5)); }}
+    .badge-corner {{ position: absolute; top: -3px; right: -3px; background: #ef4444; color: white; border-radius: 999px; padding: 0.1rem 0.35rem; font-size: 0.65rem; font-weight: bold; font-family: 'JetBrains Mono', monospace; }}
+    
+    .sync-select, .sort-select {{ background: #131926; color: var(--text); border: 1px solid var(--card-border); padding: 0.35rem 0.55rem; border-radius: 6px; font-size: 0.75rem; font-family: 'JetBrains Mono', monospace; outline: none; }}
     
     /* HUD Filter Capsule */
     .hud-filter-dock {{ background: var(--card-bg); backdrop-filter: blur(12px); border: 1px solid var(--card-border); border-radius: 12px; padding: 1rem 1.25rem; margin-bottom: 1.5rem; display: flex; flex-direction: column; gap: 0.85rem; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4); }}
     .search-row {{ display: flex; gap: 0.75rem; align-items: center; }}
     .hud-input {{ flex: 1; padding: 0.75rem 1rem; background: rgba(8, 11, 18, 0.8); border: 1px solid var(--card-border); border-radius: 8px; color: var(--text); font-size: 0.95rem; outline: none; }}
     .hud-input:focus {{ border-color: var(--primary); box-shadow: 0 0 10px rgba(29, 155, 240, 0.3); }}
+    .hud-btn {{ background: rgba(255, 255, 255, 0.06); color: var(--text); border: 1px solid var(--card-border); padding: 0.55rem 1.1rem; border-radius: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; transition: all 0.2s ease; }}
+    .hud-btn:hover {{ background: rgba(255, 255, 255, 0.12); border-color: rgba(255, 255, 255, 0.2); }}
+    .hud-btn.accent {{ background: linear-gradient(135deg, rgba(29, 155, 240, 0.3), rgba(99, 102, 241, 0.3)); border-color: rgba(29, 155, 240, 0.5); color: #fff; box-shadow: 0 0 12px rgba(29, 155, 240, 0.2); }}
     
-    /* Toolbar Group & SVG Switchers */
+    /* Toolbar Group & Switchers */
     .controls-row {{ display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.75rem; }}
     .btn-group {{ display: flex; gap: 3px; background: rgba(0, 0, 0, 0.35); border: 1px solid var(--card-border); padding: 3px; border-radius: 8px; }}
     .icon-btn {{ background: transparent; color: var(--muted); border: none; padding: 0.35rem 0.6rem; border-radius: 6px; cursor: pointer; display: flex; align-items: center; gap: 5px; font-size: 0.75rem; font-weight: 600; transition: all 0.15s ease; }}
@@ -309,22 +317,21 @@ async def index():
     .toast-progress {{ background: #131926; height: 6px; border-radius: 3px; overflow: hidden; margin-top: 0.5rem; }}
     .toast-progress-fill {{ background: linear-gradient(90deg, var(--primary), var(--success)); height: 100%; width: 0%; transition: width 0.3s ease; }}
     .toast-log {{ font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: var(--muted); max-height: 90px; overflow-y: auto; margin-top: 0.5rem; }}
-    .badge {{ background: #ef4444; color: white; border-radius: 999px; padding: 0.15rem 0.45rem; font-size: 0.75rem; font-weight: bold; }}
   </style>
 </head>
 <body>
-  <!-- Top HUD Bar -->
+  <!-- Pure HUD Floating Topbar -->
   <header class="hud-topbar">
-    <div style="display:flex; align-items:center; gap:12px;">
+    <div style="display:flex; align-items:center; gap:10px;">
       <a href="#" class="hud-brand">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
           <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
         </svg>
         <span>𝕏 LIKES HUD</span>
       </a>
-      <span class="hud-badge {'connected' if auth['connected'] else 'disconnected'}">
+      <span class="hud-badge {'connected' if auth['connected'] else 'disconnected'}" onclick="openAccountTab()" title="Manage Twitter Session">
         <span class="dot {'connected' if auth['connected'] else 'disconnected'}"></span>
-        {f'@{auth["username"]}' if auth['connected'] and auth['username'] else ('ONLINE' if auth['connected'] else 'DISCONNECTED')}
+        {f'@{auth["username"]}' if auth['connected'] and auth['username'] else ('ONLINE' if auth['connected'] else 'OFFLINE')}
       </span>
     </div>
 
@@ -333,41 +340,56 @@ async def index():
       <span class="ticker-item">TOTAL: <strong id="stat-total">{stats['total_likes']}</strong></span>
       <span class="ticker-item">MEDIA: <strong id="stat-media">{stats['archived_media_files']}</strong></span>
       <span class="ticker-item">TAGS: <strong id="stat-tags">{stats['tags_count']}</strong></span>
+      <span id="sync-countdown" style="color:#38bdf8; font-weight:600; border-left:1px solid rgba(255,255,255,0.1); padding-left:8px;">Next: --:--</span>
     </div>
 
-    <!-- Right HUD Control Deck -->
-    <div style="display:flex; align-items:center; gap:8px;">
-      <div class="sync-pill">
-        <button id="btn-auto-sync" class="hud-btn" style="padding:0.2rem 0.5rem; font-size:0.75rem;" onclick="toggleAutoSync()">
-          {'Sync: ON' if sched['enabled'] else 'Sync: OFF'}
-        </button>
-        <select id="select-interval" class="sync-select" onchange="changeSyncInterval(this.value)">
-          <option value="300" {'selected' if sched['interval_sec'] == 300 else ''}>5m</option>
-          <option value="600" {'selected' if sched['interval_sec'] == 600 else ''}>10m</option>
-          <option value="1800" {'selected' if sched['interval_sec'] == 1800 else ''}>30m</option>
-          <option value="3600" {'selected' if sched['interval_sec'] == 3600 else ''}>1h</option>
-          <option value="0" {'selected' if sched['interval_sec'] == 0 else ''}>Manual</option>
-        </select>
-        <span id="sync-countdown" style="color:var(--muted); min-width:65px;">Next: --:--</span>
-      </div>
-
-      <button id="btn-auto-unlike" class="hud-btn" onclick="toggleAutoUnlike()">
-        {'Unlike: ON' if sched.get('auto_unlike') else 'Unlike: OFF'}
+    <!-- Pure HUD SVG Icon Deck -->
+    <div class="hud-deck">
+      <!-- Auto-Sync Toggle Icon Button -->
+      <button id="btn-auto-sync-icon" class="hud-icon-btn {'active' if sched['enabled'] else ''}" onclick="toggleAutoSync()" title="Toggle Auto-Sync ({'ON' if sched['enabled'] else 'OFF'})">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
       </button>
 
-      <button id="btn-sync" class="hud-btn accent" onclick="startSyncStream()">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21.5 2v6h-6M2.5 22v-6h6"/><path d="M2 11.5a10 10 0 0 1 18.8-4.3L21.5 8M2.5 16l1.2 1.2A10 10 0 0 0 22 12.5"/></svg>
-        Sync Now
+      <!-- Sync Interval Selector -->
+      <select id="select-interval" class="sync-select" onchange="changeSyncInterval(this.value)" title="Sync Cycle Interval">
+        <option value="300" {'selected' if sched['interval_sec'] == 300 else ''}>5m</option>
+        <option value="600" {'selected' if sched['interval_sec'] == 600 else ''}>10m</option>
+        <option value="1800" {'selected' if sched['interval_sec'] == 1800 else ''}>30m</option>
+        <option value="3600" {'selected' if sched['interval_sec'] == 3600 else ''}>1h</option>
+        <option value="0" {'selected' if sched['interval_sec'] == 0 else ''}>Manual</option>
+      </select>
+
+      <!-- Auto-Unlike Toggle Icon Button -->
+      <button id="btn-auto-unlike-icon" class="hud-icon-btn {'active' if sched.get('auto_unlike') else ''}" onclick="toggleAutoUnlike()" title="Toggle Auto-Unlike on X ({'ON' if sched.get('auto_unlike') else 'OFF'})">
+        <svg viewBox="0 0 24 24"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/><path d="m12 5-1 4 2 3-2 4"/></svg>
       </button>
 
-      <button class="hud-btn" onclick="toggleSidesheet()">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-        Logs & Alerts {f'<span class="badge" id="unread-badge">{unread}</span>' if unread > 0 else '<span id="unread-badge"></span>'}
+      <!-- Sync Now Trigger Button -->
+      <button id="btn-sync-icon" class="hud-icon-btn accent" onclick="startSyncStream()" title="Trigger Immediate Sync [Stream]">
+        <svg viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
       </button>
 
-      <button class="hud-btn" onclick="document.getElementById('file-upload').click()">Import</button>
+      <!-- Logs & Notification Sidesheet Button -->
+      <button class="hud-icon-btn" onclick="toggleSidesheet()" title="Telemetry Logs & Notifications">
+        <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+        {f'<span class="badge-corner" id="unread-badge">{unread}</span>' if unread > 0 else '<span id="unread-badge"></span>'}
+      </button>
+
+      <!-- Import Archive Icon Button -->
+      <button class="hud-icon-btn" onclick="document.getElementById('file-upload').click()" title="Import Twitter like.js Archive">
+        <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+      </button>
       <input type="file" id="file-upload" style="display:none" onchange="uploadArchive(this)">
-      <button class="hud-btn" onclick="exportMarkdown()">Export</button>
+
+      <!-- Export Markdown Icon Button -->
+      <button class="hud-icon-btn" onclick="exportMarkdown()" title="Export All Tweets to Markdown Files">
+        <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      </button>
+
+      <!-- Account & Maintenance Button -->
+      <button class="hud-icon-btn" onclick="openAccountTab()" title="Twitter Account & Maintenance Tools">
+        <svg viewBox="0 0 24 24"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+      </button>
     </div>
   </header>
 
@@ -377,7 +399,7 @@ async def index():
     <div class="hud-filter-dock">
       <div class="search-row">
         <input id="query" type="text" class="hud-input" placeholder="Search likes by keywords, concepts, or semantic context..." onkeyup="if(event.key==='Enter') triggerNewSearch()">
-        <button class="hud-btn accent" onclick="triggerNewSearch()" style="padding:0.75rem 1.25rem;">Search</button>
+        <button class="hud-btn accent" onclick="triggerNewSearch()">Search</button>
         <button class="hud-btn" onclick="clearFilters()" id="btn-clear-filter" style="display:none;">Clear</button>
       </div>
 
@@ -433,8 +455,8 @@ async def index():
   <!-- HUD Right Sidesheet -->
   <aside class="hud-sidesheet" id="hud-sidesheet">
     <div class="hud-sidesheet-header">
-      <h3 style="font-size:0.95rem; font-weight:700;">HUD Control & Telemetry</h3>
-      <button class="hud-btn" onclick="toggleSidesheet()" style="padding:0.2rem 0.5rem;">✕</button>
+      <h3 style="font-size:0.95rem; font-weight:700;">HUD Telemetry & Controls</h3>
+      <button class="hud-icon-btn" onclick="toggleSidesheet()" style="width:28px; height:28px;">✕</button>
     </div>
     <div class="hud-tabs">
       <div class="hud-tab active" id="tab-btn-logs" onclick="switchHistTab('logs')">Sync Logs</div>
@@ -452,7 +474,7 @@ async def index():
         <div id="notifs-container">Loading notifications...</div>
       </div>
       <div id="tab-auth" style="display:none;">
-        <p style="color:var(--muted); font-size:0.8rem; margin-bottom:0.75rem;">Session cookies & bulk clean operations.</p>
+        <p style="color:var(--muted); font-size:0.8rem; margin-bottom:0.75rem;">Session authentication & bulk maintenance.</p>
         <input type="text" id="auth-username" class="hud-input" placeholder="@handle" style="width:100%; margin-bottom:0.5rem;">
         <input type="text" id="auth-token" class="hud-input" placeholder="auth_token (required)" style="width:100%; margin-bottom:0.5rem;">
         <input type="text" id="auth-ct0" class="hud-input" placeholder="ct0 (optional)" style="width:100%; margin-bottom:0.75rem;">
@@ -469,7 +491,7 @@ async def index():
       <span style="font-weight:600; display:flex; align-items:center; gap:6px;">
         <span class="dot connected"></span> <span id="toast-title">Syncing Likes...</span>
       </span>
-      <button class="hud-btn" onclick="document.getElementById('floating-sync-toast').style.display='none'" style="padding:0.1rem 0.35rem; font-size:0.7rem;">✕</button>
+      <button class="hud-icon-btn" onclick="document.getElementById('floating-sync-toast').style.display='none'" style="width:24px; height:24px; font-size:0.7rem;">✕</button>
     </div>
     <div class="toast-body">
       <div style="display:flex; justify-content:space-between; font-size:0.8rem;">
@@ -661,8 +683,10 @@ async def index():
       const data = await res.json();
       isSyncEnabled = data.enabled;
       nextSyncSeconds = data.status.next_sync_in_sec || syncInterval;
-      const btn = document.getElementById('btn-auto-sync');
-      btn.innerText = isSyncEnabled ? 'Sync: ON' : 'Sync: OFF';
+      const btn = document.getElementById('btn-auto-sync-icon');
+      if (isSyncEnabled) btn.classList.add('active');
+      else btn.classList.remove('active');
+      btn.title = `Toggle Auto-Sync (${{isSyncEnabled ? 'ON' : 'OFF'}})`;
     }}
 
     async function changeSyncInterval(val) {{
@@ -699,13 +723,12 @@ async def index():
       const toastFill = document.getElementById('toast-progress-fill');
       const toastPercent = document.getElementById('toast-percent');
       const toastLog = document.getElementById('toast-log');
-      const btn = document.getElementById('btn-sync');
+      const btn = document.getElementById('btn-sync-icon');
       
       toast.style.display = 'block';
       toastLog.innerHTML = '<div>[Connected] Initializing sync...</div>';
       toastFill.style.width = '10%';
       toastPercent.innerText = '10%';
-      btn.innerText = 'Syncing...';
 
       const es = new EventSource('/api/sync/stream?max_tweets=0');
       es.onmessage = function(e) {{
@@ -715,7 +738,6 @@ async def index():
           toastDetail.innerText = data.error;
           toastLog.innerHTML += `<div style="color:#ef4444;">[ERROR] ${{data.error}}</div>`;
           es.close();
-          btn.innerText = 'Sync Now';
           return;
         }}
         if (data.stage === 'scrolling') {{
@@ -737,7 +759,6 @@ async def index():
           toastDetail.innerText = data.message;
           toastLog.innerHTML += `<div style="color:#10b981; font-weight:bold;">[DONE] ${{data.message}}</div>`;
           es.close();
-          btn.innerText = 'Sync Now';
           refreshStats();
           if (!currentQuery && !currentTag) loadLikes(false);
           setTimeout(() => {{ toast.style.display = 'none'; }}, 4000);
@@ -746,7 +767,6 @@ async def index():
       es.onerror = function() {{
         toastTitle.innerText = 'Sync Ended';
         es.close();
-        btn.innerText = 'Sync Now';
       }};
     }}
 
@@ -757,6 +777,12 @@ async def index():
         loadHistoryLogs();
         loadNotifications();
       }}
+    }}
+
+    function openAccountTab() {{
+      const sheet = document.getElementById('hud-sidesheet');
+      if (!sheet.classList.contains('open')) sheet.classList.add('open');
+      switchHistTab('auth');
     }}
 
     function switchHistTab(t) {{
@@ -816,7 +842,10 @@ async def index():
     async function toggleAutoUnlike() {{
       const res = await fetch('/api/settings/auto-unlike/toggle', {{ method: 'POST' }});
       const data = await res.json();
-      document.getElementById('btn-auto-unlike').innerText = data.auto_unlike ? 'Unlike: ON' : 'Unlike: OFF';
+      const btn = document.getElementById('btn-auto-unlike-icon');
+      if (data.auto_unlike) btn.classList.add('active');
+      else btn.classList.remove('active');
+      btn.title = `Toggle Auto-Unlike on X (${{data.auto_unlike ? 'ON' : 'OFF'}})`;
     }}
 
     async function startBulkUnlike() {{
