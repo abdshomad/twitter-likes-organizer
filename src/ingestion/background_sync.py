@@ -9,6 +9,7 @@ from src.ai.tagger import AITagger
 from src.ai.embedder import VectorEmbedder
 from src.media.downloader import MediaDownloader
 from src.ingestion.playwright_scraper import PlaywrightXScraper
+from src.ingestion.graphql_client import TwitterGraphQLClient
 
 SYNC_STATE_PATH = Path(os.getenv("DATA_DIR", "data")) / "sync_state.json"
 
@@ -24,6 +25,7 @@ class BackgroundSyncScheduler:
         interval_sec: int = 600,
     ):
         self.scraper = scraper
+        self.gql_client = TwitterGraphQLClient(scraper.session_path)
         self.store = store
         self.tagger = tagger
         self.embedder = embedder
@@ -102,7 +104,11 @@ class BackgroundSyncScheduler:
                 existing_ids.add(tweet.get("id"))
                 inserted_count += 1
 
-            await self.scraper.scrape_likes(max_tweets=0, on_item_found=on_item_found)
+            uname = status.get("username", "")
+            try:
+                await self.gql_client.fetch_all_likes_streaming(username=uname, max_tweets=0, on_item_found=on_item_found)
+            except Exception:
+                await self.scraper.scrape_likes(username=uname, max_tweets=0, on_item_found=on_item_found)
 
             self.last_sync_time = time.time()
             self.total_synced_count += inserted_count

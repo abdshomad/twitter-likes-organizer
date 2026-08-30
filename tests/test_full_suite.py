@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -5,6 +6,7 @@ from src.server.app import app, store
 from src.exporter.markdown_exporter import format_tweet_to_markdown, export_tweets_to_directory
 from src.ai.tagger import AITagger
 from src.ingestion.playwright_scraper import PlaywrightXScraper
+from src.ingestion.graphql_client import TwitterGraphQLClient
 
 
 def test_markdown_formatter():
@@ -51,6 +53,75 @@ def test_isolated_scraper_persistence(tmp_path):
     session_file.unlink()
     assert s.get_session_status()["connected"] is True
     assert session_file.exists()
+
+
+def test_graphql_response_parser(tmp_path):
+    session_file = tmp_path / "session.json"
+    session_file.write_text(json.dumps({
+        "cookies": [{"name": "auth_token", "value": "test_auth"}, {"name": "ct0", "value": "test_ct0"}],
+        "metadata": {"username": "testuser", "user_id": "12345"}
+    }))
+    client = TwitterGraphQLClient(session_path=session_file)
+    headers = client._get_auth_headers()
+    assert "authorization" in headers
+    assert "auth_token=test_auth" in headers["cookie"]
+
+    # Mock GraphQL response payload
+    mock_payload = {
+        "data": {
+            "user": {
+                "result": {
+                    "timeline_v2": {
+                        "timeline": {
+                            "instructions": [
+                                {
+                                    "type": "TimelineAddEntries",
+                                    "entries": [
+                                        {
+                                            "entryId": "tweet-9999",
+                                            "content": {
+                                                "itemContent": {
+                                                    "tweet_results": {
+                                                        "result": {
+                                                            "legacy": {
+                                                                "id_str": "9999",
+                                                                "full_text": "GraphQL is ultra fast!",
+                                                                "created_at": "Sun Aug 30 00:00:00 +0000 2026",
+                                                            },
+                                                            "core": {
+                                                                "user_results": {
+                                                                    "result": {
+                                                                        "legacy": {
+                                                                            "name": "Dev",
+                                                                            "screen_name": "developer"
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        {
+                                            "entryId": "cursor-bottom-12345",
+                                            "content": {"value": "cursor_next_token"}
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+    }
+    tweets, next_cursor = client._parse_likes_response(mock_payload)
+    assert len(tweets) == 1
+    assert tweets[0]["tweet_id"] == "9999"
+    assert tweets[0]["author_handle"] == "developer"
+    assert tweets[0]["text"] == "GraphQL is ultra fast!"
+    assert next_cursor == "cursor_next_token"
 
 
 @pytest.mark.asyncio

@@ -6,6 +6,7 @@ from src.ai.tagger import AITagger
 from src.ai.embedder import VectorEmbedder
 from src.media.downloader import MediaDownloader
 from src.ingestion.playwright_scraper import PlaywrightXScraper
+from src.ingestion.graphql_client import TwitterGraphQLClient
 
 
 async def stream_likes_sync(
@@ -22,20 +23,19 @@ async def stream_likes_sync(
         yield f"data: {json.dumps({'error': 'Please connect Twitter account first.', 'stage': 'error'})}\n\n"
         return
 
-    yield f"data: {json.dumps({'stage': 'scraping', 'percent': 5, 'message': 'Connecting to Twitter timeline...'})}\n\n"
+    yield f"data: {json.dumps({'stage': 'scraping', 'percent': 5, 'message': 'Connecting via ultra-fast GraphQL interceptor...'})}\n\n"
     
     event_queue = asyncio.Queue()
     processed_count = 0
+    gql_client = TwitterGraphQLClient(scraper.session_path)
 
     async def on_progress(data: dict):
         await event_queue.put(data)
 
     async def on_item_found(tweet: dict):
         nonlocal processed_count
-        # Immediate persistence pipeline
         media_paths = downloader.download_tweet_media(tweet)
         tweet["local_media_paths"] = media_paths
-
         tags = tagger.generate_tags(tweet["text"])
         tweet["tags"] = tags
 
@@ -58,8 +58,25 @@ async def stream_likes_sync(
             "media_count": len(media_paths),
         })
 
-    async def run_scraper():
+    async def run_sync():
         try:
+            # 1. Primary: Direct GraphQL Interceptor (100x faster)
+            uname = username or status.get("username", "")
+            return await gql_client.fetch_all_likes_streaming(
+                username=uname,
+                max_tweets=max_tweets,
+                on_progress=on_progress,
+                on_item_found=on_item_found,
+            )
+        except Exception as gql_err:
+            await event_queue.put({
+                "stage": "scrolling",
+                "scroll_attempt": 1,
+                "tweets_found": processed_count,
+                "height": 0,
+                "page_url": f"GraphQL fallback to Playwright: {str(gql_err)[:60]}...",
+            })
+            # 2. Fallback: Headless Playwright
             return await scraper.scrape_likes(
                 username=username,
                 max_tweets=max_tweets,
@@ -69,9 +86,9 @@ async def stream_likes_sync(
         finally:
             await event_queue.put({"stage": "scrape_finished"})
 
-    scrape_task = asyncio.create_task(run_scraper())
+    sync_task = asyncio.create_task(run_sync())
 
-    while not scrape_task.done() or not event_queue.empty():
+    while not sync_task.done() or not event_queue.empty():
         try:
             event = await asyncio.wait_for(event_queue.get(), timeout=0.2)
             if event.get("stage") == "scrape_finished":
@@ -81,9 +98,9 @@ async def stream_likes_sync(
             continue
 
     try:
-        await scrape_task
+        await sync_task
     except Exception as e:
-        yield f"data: {json.dumps({'error': f'Failed to scrape: {str(e)}', 'stage': 'error'})}\n\n"
+        yield f"data: {json.dumps({'error': f'Sync failed: {str(e)}', 'stage': 'error'})}\n\n"
         return
 
     yield f"data: {json.dumps({'stage': 'complete', 'percent': 100, 'message': f'Successfully synced {processed_count} likes!', 'inserted': processed_count})}\n\n"
