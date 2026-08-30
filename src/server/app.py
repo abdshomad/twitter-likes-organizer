@@ -231,6 +231,27 @@ async def search_likes(
     }
 
 
+@app.get("/api/tweets/{tweet_id}/similar")
+async def get_similar_tweets(tweet_id: str, limit: int = Query(4, ge=1, le=20)):
+    target_results = store.search_hybrid(query=tweet_id, limit=5)
+    target = next((t for t in target_results if str(t.get("tweet_id")) == str(tweet_id)), None)
+    
+    vector = None
+    if target and target.get("vector") and any(v != 0.0 for v in target.get("vector")):
+        vector = target["vector"]
+    elif target and target.get("text"):
+        vector = embedder.embed_text(target["text"])
+
+    if not vector:
+        query_kw = target.get("text", "") if target else ""
+        similar = store.search_hybrid(query=query_kw, limit=limit + 4)
+    else:
+        similar = store.search_hybrid(query_vector=vector, limit=limit + 4)
+
+    filtered = [t for t in similar if str(t.get("tweet_id")) != str(tweet_id)][:limit]
+    return {"tweet_id": tweet_id, "count": len(filtered), "similar": filtered}
+
+
 @app.post("/api/ingest/archive")
 async def ingest_archive(file: UploadFile = File(...)):
     content = await file.read()
@@ -408,6 +429,13 @@ async def index():
     .hud-modal-media {{ display: flex; flex-direction: column; gap: 0.75rem; }}
     .hud-modal-img {{ width: 100%; max-height: 480px; object-fit: contain; background: #000; border-radius: 10px; border: 1px solid var(--card-border); }}
     .hud-modal-actions {{ display: flex; flex-wrap: wrap; gap: 8px; padding-top: 1rem; border-top: 1px solid var(--card-border); }}
+    
+    /* Similar Tweets Cards inside Modal */
+    .similar-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.65rem; margin-top: 0.5rem; }}
+    .similar-card {{ background: rgba(0, 0, 0, 0.4); border: 1px solid var(--card-border); border-radius: 8px; padding: 0.75rem; cursor: pointer; display: flex; flex-direction: column; justify-content: space-between; gap: 6px; transition: all 0.15s ease; }}
+    .similar-card:hover {{ border-color: var(--primary); transform: translateY(-2px); background: rgba(29, 155, 240, 0.05); }}
+    .similar-card-header {{ display: flex; align-items: center; justify-content: space-between; font-size: 0.75rem; }}
+    .similar-card-text {{ font-size: 0.78rem; line-height: 1.35; color: #cbd5e1; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }}
 
     /* Shimmer Skeleton */
     .skeleton {{ background: linear-gradient(90deg, #101524 25%, #192238 50%, #101524 75%); background-size: 200% 100%; animation: shimmer 1.5s infinite; border-radius: 6px; }}
@@ -619,6 +647,18 @@ async def index():
         <div id="modal-tweet-text" class="tweet-text" style="font-size:1rem; line-height:1.5;"></div>
         <div id="modal-media-container" class="hud-modal-media"></div>
         <div id="modal-tags-container" style="display:flex; flex-wrap:wrap; gap:6px;"></div>
+        
+        <!-- ✨ Similar Likes Section -->
+        <div id="modal-similar-section" style="margin-top:1rem; border-top:1px solid var(--card-border); padding-top:1rem;">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.6rem;">
+            <span style="font-size:0.85rem; font-weight:700; color:#e2e8f0; display:flex; align-items:center; gap:6px;">
+              <span>✨</span> Similar Likes You Might Enjoy
+            </span>
+            <span id="similar-loading-indicator" style="font-size:0.72rem; color:var(--muted); font-family:'JetBrains Mono',monospace;"></span>
+          </div>
+          <div id="modal-similar-grid" class="similar-grid"></div>
+        </div>
+
         <div class="hud-modal-actions">
           <button class="hud-btn" onclick="copyTweetText()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Copy Text</button>
           <button class="hud-btn" onclick="copyTweetLink()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg> Copy Link</button>
@@ -753,6 +793,18 @@ async def index():
               <option value="card">Rich Cards</option>
               <option value="list">Compact List</option>
               <option value="gallery">Media Gallery</option>
+            </select>
+          </div>
+          <div class="settings-row">
+            <div>
+              <div class="settings-label">Similar Tweets Count</div>
+              <div class="settings-desc">Semantic recommendations in tweet modal</div>
+            </div>
+            <select id="setting-similar-count" class="sync-select" onchange="updateSimilarLimit(this.value)">
+              <option value="3">Top 3 Similar</option>
+              <option value="4" selected>Top 4 Similar (Default)</option>
+              <option value="6">Top 6 Similar</option>
+              <option value="8">Top 8 Similar</option>
             </select>
           </div>
         </div>
@@ -1170,6 +1222,50 @@ async def index():
       const tagsContainer = document.getElementById('modal-tags-container');
       tagsContainer.innerHTML = (tweet.tags || []).map(t => `<span class="hud-tag" onclick="filterTag('${{t}}')">${{t}}</span>`).join(' ');
 
+      // Fetch and render similar tweets
+      const similarGrid = document.getElementById('modal-similar-grid');
+      const similarIndicator = document.getElementById('similar-loading-indicator');
+      if (similarGrid && similarIndicator) {{
+        similarGrid.innerHTML = `
+          <div class="skeleton" style="height:65px; border-radius:8px;"></div>
+          <div class="skeleton" style="height:65px; border-radius:8px;"></div>
+        `;
+        similarIndicator.innerText = '🧠 Finding similar...';
+
+        const similarLimit = parseInt(localStorage.getItem('hud_similar_limit') || '4');
+        fetch(`/api/tweets/${{tweetId}}/similar?limit=${{similarLimit}}`)
+          .then(res => res.json())
+          .then(data => {{
+            const similar = data.similar || [];
+            similarIndicator.innerText = `${{similar.length}} found`;
+            if (similar.length === 0) {{
+              similarGrid.innerHTML = '<p style="color:var(--muted); font-size:0.75rem; grid-column:1/-1;">No similar tweets found.</p>';
+              return;
+            }}
+            similar.forEach(s => loadedTweetsMap.set(s.tweet_id, s));
+            similarGrid.innerHTML = similar.map(s => {{
+              const cleanH = (s.author_handle || '').replace(/^@+/, '');
+              const authorD = cleanH ? '@' + cleanH : 'Tweet';
+              return `
+                <div class="similar-card" onclick="openTweetModal('${{s.tweet_id}}')">
+                  <div class="similar-card-header">
+                    <span style="font-weight:700; color:var(--text);">${{s.author_name || authorD}}</span>
+                    <span style="color:var(--muted); font-family:'JetBrains Mono',monospace;">${{cleanH ? '@' + cleanH : ''}}</span>
+                  </div>
+                  <div class="similar-card-text">${{s.text}}</div>
+                  <div style="display:flex; gap:4px; margin-top:2px;">
+                    ${{(s.tags || []).slice(0, 2).map(t => `<span class="hud-tag" style="font-size:0.65rem; padding:1px 5px;" onclick="event.stopPropagation(); filterTag('${{t}}')">${{t}}</span>`).join('')}}
+                  </div>
+                </div>
+              `;
+            }}).join('');
+          }})
+          .catch(() => {{
+            similarIndicator.innerText = '';
+            similarGrid.innerHTML = '<p style="color:var(--muted); font-size:0.75rem; grid-column:1/-1;">Could not load similar tweets.</p>';
+          }});
+      }}
+
       document.getElementById('hud-tweet-modal').classList.add('open');
     }}
 
@@ -1575,6 +1671,13 @@ async def index():
       alert(`Exported ${{data.exported_count}} tweets to ${{data.export_dir}}!`);
     }}
 
+    function updateSimilarLimit(val) {{
+      localStorage.setItem('hud_similar_limit', val);
+      if (activeModalTweet) {{
+        openTweetModal(activeModalTweet.tweet_id);
+      }}
+    }}
+
     function prefetchTopTags() {{
       const topTags = Array.from(document.querySelectorAll('.hud-tag')).slice(0, 6).map(el => el.id.replace('tag-', ''));
       topTags.forEach(tag => {{
@@ -1593,6 +1696,9 @@ async def index():
       if (tagLimitSelect) tagLimitSelect.value = savedTagLimit;
       const feedModeSelect = document.getElementById('setting-layout-mode');
       if (feedModeSelect) feedModeSelect.value = displayMode;
+      const savedSimilarLimit = localStorage.getItem('hud_similar_limit') || '4';
+      const similarLimitSelect = document.getElementById('setting-similar-count');
+      if (similarLimitSelect) similarLimitSelect.value = savedSimilarLimit;
       loadLikes(false);
       setTimeout(prefetchTopTags, 500);
     }});
