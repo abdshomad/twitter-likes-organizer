@@ -72,24 +72,26 @@ class PlaywrightXScraper:
         if self.backup_path.exists():
             self.backup_path.unlink()
 
-    async def scrape_likes(
+    async def scrape_timeline(
         self,
+        target: str = "likes",
         username: str = "",
         max_tweets: int = 0,
         on_progress: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         on_item_found: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> list[dict[str, Any]]:
         self._ensure_restored()
-        target = self.session_path if self.session_path.exists() else self.backup_path
-        if not target.exists():
+        target_path = self.session_path if self.session_path.exists() else self.backup_path
+        if not target_path.exists():
             raise FileNotFoundError("Session file not found. Please connect Twitter first.")
 
-        storage_data = json.loads(target.read_text())
+        storage_data = json.loads(target_path.read_text())
         if not username:
             username = storage_data.get("metadata", {}).get("username", "")
 
         extracted_tweets: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
+        source_tag = "bookmark" if target == "bookmarks" else "like"
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(
@@ -102,7 +104,13 @@ class PlaywrightXScraper:
             )
             page = await context.new_page()
 
-            for url in ["https://x.com/i/history/likes", f"https://x.com/{username}/likes" if username else None]:
+            urls_to_try = (
+                ["https://x.com/i/bookmarks"]
+                if target == "bookmarks"
+                else ["https://x.com/i/history/likes", f"https://x.com/{username}/likes" if username else None]
+            )
+
+            for url in urls_to_try:
                 if not url:
                     continue
                 try:
@@ -157,7 +165,6 @@ class PlaywrightXScraper:
                             if src:
                                 media_urls.append(src)
 
-                        # Extract like count
                         favorite_count = 0
                         like_btn = article.locator("button[data-testid='like'], button[data-testid='unlike'], div[data-testid='like'], div[data-testid='unlike']").first
                         if await like_btn.count() > 0:
@@ -196,6 +203,7 @@ class PlaywrightXScraper:
                             "local_media_paths": [],
                             "tags": [],
                             "favorite_count": favorite_count,
+                            "source": source_tag,
                             "raw_json": json.dumps({"id": tweet_id, "text": tweet_text, "user": author_handle, "favorite_count": favorite_count}),
                         }
                         extracted_tweets.append(tweet_obj)
@@ -232,3 +240,103 @@ class PlaywrightXScraper:
 
             await browser.close()
             return extracted_tweets
+
+    async def scrape_likes(
+        self,
+        username: str = "",
+        max_tweets: int = 0,
+        on_progress: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        on_item_found: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> list[dict[str, Any]]:
+        return await self.scrape_timeline(
+            target="likes",
+            username=username,
+            max_tweets=max_tweets,
+            on_progress=on_progress,
+            on_item_found=on_item_found,
+        )
+
+    async def scrape_bookmarks(
+        self,
+        max_tweets: int = 0,
+        on_progress: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        on_item_found: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> list[dict[str, Any]]:
+        return await self.scrape_timeline(
+            target="bookmarks",
+            username="",
+            max_tweets=max_tweets,
+            on_progress=on_progress,
+            on_item_found=on_item_found,
+        )
+
+    async def scrape_single_tweet(self, url_or_id: str) -> dict[str, Any] | None:
+        self._ensure_restored()
+        target_path = self.session_path if self.session_path.exists() else self.backup_path
+        storage_data = json.loads(target_path.read_text()) if target_path.exists() else None
+
+        clean_input = url_or_id.strip()
+        if clean_input.isdigit():
+            target_url = f"https://x.com/i/status/{clean_input}"
+            tweet_id = clean_input
+        elif "/status/" in clean_input:
+            target_url = clean_input
+            tweet_id = clean_input.split("/status/")[-1].split("?")[0].split("/")[0]
+        else:
+            return None
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+            )
+            context = await browser.new_context(
+                storage_state=storage_data,
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            ) if storage_data else await browser.new_context()
+
+            page = await context.new_page()
+            try:
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=15000)
+                await page.wait_for_selector("article[data-testid='tweet']", timeout=8000)
+            except Exception:
+                pass
+
+            article = page.locator("article[data-testid='tweet']").first
+            if await article.count() == 0:
+                await browser.close()
+                return None
+
+            text_el = article.locator("div[data-testid='tweetText']")
+            tweet_text = await text_el.inner_text() if await text_el.count() > 0 else ""
+            
+            user_el = article.locator("div[data-testid='User-Name']")
+            user_text = await user_el.inner_text() if await user_el.count() > 0 else ""
+            lines = [line.strip() for line in user_text.split("\n") if line.strip()]
+            author_name = lines[0] if len(lines) > 0 else ""
+            handle_line = next((l for l in lines if l.startswith("@")), "")
+            author_handle = handle_line.lstrip("@") if handle_line else ""
+
+            media_urls: list[str] = []
+            for img in await article.locator("div[data-testid='tweetPhoto'] img").all():
+                src = await img.get_attribute("src")
+                if src:
+                    media_urls.append(src)
+
+            await browser.close()
+            return {
+                "id": tweet_id,
+                "tweet_id": tweet_id,
+                "author_name": author_name or author_handle or "Creator",
+                "author_handle": author_handle,
+                "text": tweet_text,
+                "created_at": "",
+                "liked_at": "",
+                "url": f"https://x.com/{author_handle or 'i'}/status/{tweet_id}",
+                "media_urls": media_urls,
+                "local_media_paths": [],
+                "tags": [],
+                "favorite_count": 0,
+                "source": "like",
+                "raw_json": json.dumps({"id": tweet_id, "text": tweet_text, "user": author_handle}),
+            }

@@ -3,7 +3,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncGenerator
 from src.storage.lancedb_client import LanceDBStore
 from src.storage.history_manager import HistoryManager
 from src.media.media_queue import MediaQueue
@@ -43,6 +43,7 @@ class BackgroundSyncScheduler:
         self.last_sync_time: float = 0
         self.total_synced_count: int = 0
         self.last_spared_tweet_id: str = ""
+        self.swept_ghost_ids: set[str] = set()
         self._load_state()
 
     def _load_state(self):
@@ -55,6 +56,7 @@ class BackgroundSyncScheduler:
                 self.last_sync_time = data.get("last_sync_time", 0)
                 self.total_synced_count = data.get("total_synced_count", 0)
                 self.last_spared_tweet_id = data.get("last_spared_tweet_id", "")
+                self.swept_ghost_ids = set(data.get("swept_ghost_ids", []))
             except Exception:
                 pass
         else:
@@ -69,6 +71,7 @@ class BackgroundSyncScheduler:
             "total_synced_count": self.total_synced_count,
             "interval_sec": self.interval_sec,
             "last_spared_tweet_id": self.last_spared_tweet_id,
+            "swept_ghost_ids": list(self.swept_ghost_ids),
         }
         SYNC_STATE_PATH.write_text(json.dumps(data, indent=2))
 
@@ -85,6 +88,7 @@ class BackgroundSyncScheduler:
             "last_sync_time": self.last_sync_time,
             "total_synced_count": self.total_synced_count,
             "last_spared_tweet_id": self.last_spared_tweet_id,
+            "swept_ghost_count": len(self.swept_ghost_ids),
         }
 
     def toggle(self, enable: bool | None = None) -> bool:
@@ -121,14 +125,15 @@ class BackgroundSyncScheduler:
             existing_ids = {t["tweet_id"] for t in existing_tweets if t.get("tweet_id")}
 
             discovered_batch: list[dict[str, Any]] = []
+            discovered_bookmarks: list[dict[str, Any]] = []
 
-            async def on_item_found(tweet: dict):
+            async def on_like_found(tweet: dict):
                 nonlocal inserted_count
-                # Check time cutoff: stop extracting 1 min before next batch
                 if (time.time() - start_time) >= max_duration_sec:
                     return
 
                 tid = str(tweet.get("id") or tweet.get("tweet_id"))
+                tweet["source"] = tweet.get("source") or "like"
                 discovered_batch.append(tweet)
 
                 if tid not in existing_ids:
@@ -142,7 +147,7 @@ class BackgroundSyncScheduler:
                     except Exception:
                         tweet["vector"] = [0.0] * 1024
 
-                    self.store.upsert_tweets([tweet])
+                    self.store.upsert_tweets([tweet], default_source="like")
                     existing_ids.add(tid)
                     inserted_count += 1
 
@@ -158,16 +163,69 @@ class BackgroundSyncScheduler:
                         except Exception:
                             pass
 
+            async def on_bookmark_found(tweet: dict):
+                nonlocal inserted_count
+                if (time.time() - start_time) >= max_duration_sec:
+                    return
+
+                tid = str(tweet.get("id") or tweet.get("tweet_id"))
+                tweet["source"] = tweet.get("source") or "bookmark"
+                discovered_bookmarks.append(tweet)
+
+                if tid not in existing_ids:
+                    media_urls = tweet.get("media_urls", [])
+                    if media_urls:
+                        await self.media_queue.enqueue(tid, media_urls)
+
+                    tweet["tags"] = self.tagger.generate_tags(tweet.get("text", ""))
+                    try:
+                        tweet["vector"] = self.embedder.embed_text(tweet.get("text", ""))
+                    except Exception:
+                        tweet["vector"] = [0.0] * 1024
+
+                    self.store.upsert_tweets([tweet], default_source="bookmark")
+                    existing_ids.add(tid)
+                    inserted_count += 1
+
+                    if self.on_telemetry_event:
+                        try:
+                            await self.on_telemetry_event("new_bookmark", {
+                                "tweet_id": tid,
+                                "author_handle": tweet.get("author_handle", ""),
+                                "author_name": tweet.get("author_name", ""),
+                                "text": tweet.get("text", "")[:120],
+                                "favorite_count": tweet.get("favorite_count", 0),
+                            })
+                        except Exception:
+                            pass
+
             uname = status.get("username", "")
+            # Sync Likes
+            likes_count = 0
             try:
                 async for tweet in self.gql_client.fetch_all_likes_streaming(username=uname, max_tweets=0):
-                    await on_item_found(tweet)
+                    likes_count += 1
+                    await on_like_found(tweet)
+                if likes_count == 0:
+                    raise RuntimeError("GraphQL Likes returned 0 items; falling back to Playwright scraper")
             except Exception:
                 engine_used = "playwright"
-                await self.scraper.scrape_likes(username=uname, max_tweets=0, on_item_found=on_item_found)
+                await self.scraper.scrape_likes(username=uname, max_tweets=0, on_item_found=on_like_found)
 
-            # Unlike all discovered likes from top to bottom on X
-            if self.auto_unlike and discovered_batch:
+            # Sync Bookmarks
+            try:
+                async for tweet in self.gql_client.fetch_all_bookmarks_streaming(max_tweets=0):
+                    await on_bookmark_found(tweet)
+            except Exception:
+                if engine_used != "playwright":
+                    engine_used = "graphql+playwright"
+                try:
+                    await self.scraper.scrape_bookmarks(max_tweets=0, on_item_found=on_bookmark_found)
+                except Exception:
+                    pass
+
+            # Clean/Unlike/Unbookmark on X if auto_unlike is enabled
+            if self.auto_unlike and (discovered_batch or discovered_bookmarks):
                 for t in discovered_batch:
                     if (time.time() - start_time) >= max_duration_sec:
                         break
@@ -180,24 +238,54 @@ class BackgroundSyncScheduler:
                     except Exception:
                         pass
 
+                for t in discovered_bookmarks:
+                    if (time.time() - start_time) >= max_duration_sec:
+                        break
+                    tid = str(t.get("id") or t.get("tweet_id"))
+                    try:
+                        await self.unliker.ensure_unbookmarked(tid, max_attempts=3)
+                        await asyncio.sleep(0.5)
+                    except Exception:
+                        pass
+
+            # Ghost likes incremental batch sweeper: Purge next 60 unswept stored likes
+            ghost_purged_count = 0
+            if self.auto_unlike and (time.time() - start_time) < max_duration_sec:
+                try:
+                    stored_likes = self.store.get_all_tweets(limit=100000, source="like")
+                    candidates = [
+                        str(t.get("tweet_id") or t.get("id"))
+                        for t in stored_likes
+                        if str(t.get("tweet_id") or t.get("id")) and str(t.get("tweet_id") or t.get("id")) not in self.swept_ghost_ids
+                    ]
+                    batch_candidates = candidates[:60]
+                    if batch_candidates:
+                        p_count, swept_ids = await self.unliker.sweep_ghost_likes(batch_candidates)
+                        ghost_purged_count = p_count
+                        self.swept_ghost_ids.update(swept_ids)
+                except Exception:
+                    pass
+
             self.last_sync_time = time.time()
             self.total_synced_count += inserted_count
             self._save_state()
 
             duration = time.time() - start_time
-            total_db = self.store.get_stats().get("total_likes", 0)
+            stats = self.store.get_stats()
+            total_db = stats.get("total_items", stats.get("total_likes", 0))
             self.history.add_sync_log(
                 trigger="auto-cron-5m",
                 engine=engine_used,
                 status="success",
                 new_likes=inserted_count,
                 total_db_likes=total_db,
-                message=f"Sync cycle completed (+{inserted_count} saved, {unliked_count} unliked, 1 spared anchor).",
+                message=f"Sync cycle completed (+{inserted_count} saved, {unliked_count} live unliked, {ghost_purged_count} ghosts purged).",
                 duration_sec=duration,
             )
         except Exception as e:
             duration = time.time() - start_time
-            total_db = self.store.get_stats().get("total_likes", 0)
+            stats = self.store.get_stats()
+            total_db = stats.get("total_items", stats.get("total_likes", 0))
             self.history.add_sync_log(
                 trigger="auto-cron-5m",
                 engine=engine_used,
@@ -210,6 +298,50 @@ class BackgroundSyncScheduler:
         finally:
             self.is_running = False
         return inserted_count
+
+    async def sweep_ghost_likes_stream(self, limit: int = 100) -> AsyncGenerator[str, None]:
+        stored_likes = self.store.get_all_tweets(limit=100000, source="like")
+        candidates = [
+            str(t.get("tweet_id") or t.get("id"))
+            for t in stored_likes
+            if str(t.get("tweet_id") or t.get("id")) and str(t.get("tweet_id") or t.get("id")) not in self.swept_ghost_ids
+        ]
+        target_batch = candidates[:limit] if limit > 0 else candidates
+        total = len(target_batch)
+        if total == 0:
+            yield f"data: {json.dumps({'stage': 'complete', 'total': 0, 'purged': 0, 'message': 'All stored likes have already been swept for ghost status.'})}\n\n"
+            return
+
+        yield f"data: {json.dumps({'stage': 'start', 'total': total, 'message': f'Starting ghost like purge for {total} candidates...'})}\n\n"
+
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+        async def on_prog(ev: dict[str, Any]):
+            await queue.put(ev)
+
+        async def run_worker():
+            purged, swept = await self.unliker.sweep_ghost_likes(target_batch, on_progress=on_prog)
+            self.swept_ghost_ids.update(swept)
+            self._save_state()
+            await queue.put({
+                "stage": "complete",
+                "total": total,
+                "purged": purged,
+                "message": f"Ghost purge completed. Cleaned {purged} ghost references on X.",
+            })
+
+        worker_task = asyncio.create_task(run_worker())
+
+        while not worker_task.done() or not queue.empty():
+            try:
+                ev = await asyncio.wait_for(queue.get(), timeout=0.2)
+                yield f"data: {json.dumps(ev)}\n\n"
+                if ev.get("stage") == "complete":
+                    break
+            except asyncio.TimeoutError:
+                continue
+
+        await worker_task
 
     async def start_loop(self):
         while True:

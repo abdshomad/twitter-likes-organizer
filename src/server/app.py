@@ -5,25 +5,30 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
-from fastapi import FastAPI, UploadFile, File, Query, BackgroundTasks, Body, Request
+from pydantic import BaseModel
+from fastapi import FastAPI, UploadFile, File, Query, BackgroundTasks, Body, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from src.server.config import HOST, PORT, DATA_DIR, MEDIA_DIR
 from src.storage.lancedb_client import LanceDBStore
+from src.storage.meilisearch_client import MeiliSearchStore
 from src.storage.history_manager import HistoryManager
 from src.media.media_queue import MediaQueue
 from src.ai.tagger import AITagger
 from src.ai.embedder import VectorEmbedder
 from src.ai.rag_chat import RAGChatEngine
 from src.exporter.markdown_exporter import export_tweets_to_directory
-from src.ingestion.archive_parser import parse_like_js_content
+from src.ingestion.archive_parser import parse_like_js_content, parse_bookmarks_js_content, parse_archive_content
 from src.ingestion.playwright_scraper import PlaywrightXScraper
 from src.ingestion.graphql_client import TwitterGraphQLClient
 from src.ingestion.unliker import TwitterUnliker
-from src.ingestion.sync_pipeline import stream_likes_sync
+from src.ingestion.sync_pipeline import stream_likes_sync, stream_bookmarks_sync
 from src.ingestion.author_hydrator import AuthorHydrator
 from src.ingestion.metrics_enricher import TweetMetricsEnricher
 from src.ingestion.background_sync import BackgroundSyncScheduler
+from src.ingestion.youtube_parser import parse_youtube_takeout_content
+from src.ingestion.youtube_client import stream_youtube_sync
+from src.ingestion.ytdlp_client import YtDlpExtractor, get_saved_transcript, stream_batch_fetch_transcripts
 
 
 class TelemetryBroadcaster:
@@ -53,6 +58,7 @@ telemetry_broadcaster = TelemetryBroadcaster()
 
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 store = LanceDBStore()
+meili_store = MeiliSearchStore()
 history = HistoryManager()
 tagger = AITagger()
 embedder = VectorEmbedder()
@@ -98,6 +104,17 @@ app = FastAPI(title="𝕏 Likes Organizer HUD", version="0.2.0", lifespan=lifesp
 app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media")
 
 
+@app.middleware("http")
+async def add_cache_control_headers(request: Request, call_next):
+    response = await call_next(request)
+    ct = response.headers.get("content-type", "")
+    if "text/html" in ct or "application/json" in ct:
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
+
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
     return HTMLResponse('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><text y="20" font-size="20">𝕏</text></svg>', media_type="image/svg+xml")
@@ -116,8 +133,8 @@ async def get_stats():
 
 
 @app.get("/api/tags")
-async def get_tags():
-    return {"tags": store.get_all_tags()}
+async def get_tags(source: str = Query("all")):
+    return {"tags": store.get_all_tags(source=source)}
 
 
 @app.get("/api/auth/status")
@@ -131,7 +148,7 @@ async def scheduler_status():
 
 
 @app.get("/api/telemetry/stream")
-async def telemetry_stream(request: Request):
+async def telemetry_stream(request: Request, once: bool = False):
     async def event_generator():
         q = await telemetry_broadcaster.subscribe()
         try:
@@ -147,11 +164,14 @@ async def telemetry_stream(request: Request):
             }
             yield f"event: stats\ndata: {json.dumps(initial_data)}\n\n"
 
+            if once:
+                return
+
             while True:
                 if await request.is_disconnected():
                     break
                 try:
-                    msg = await asyncio.wait_for(q.get(), timeout=8.0)
+                    msg = await asyncio.wait_for(q.get(), timeout=1.5)
                     yield msg
                 except asyncio.TimeoutError:
                     stats = store.get_stats()
@@ -211,11 +231,41 @@ async def maintenance_unlike_single(payload: dict[str, Any] = Body(...)):
     return {"status": "success" if success else "failed", "tweet_id": tweet_id, "unliked": success}
 
 
+@app.post("/api/maintenance/unbookmark-single")
+async def maintenance_unbookmark_single(payload: dict[str, Any] = Body(...)):
+    tweet_id = payload.get("tweet_id", "")
+    if not tweet_id:
+        return JSONResponse({"status": "error", "message": "tweet_id is required"}, status_code=400)
+    success = await unliker.unbookmark_tweet(tweet_id)
+    if success:
+        store.unbookmark_tweets([tweet_id])
+    return {"status": "success" if success else "failed", "tweet_id": tweet_id, "unbookmarked": success}
+
+
 @app.post("/api/maintenance/unlike-synced")
 async def maintenance_unlike_synced(bg: BackgroundTasks):
-    tweets = store.get_all_tweets(limit=10000)
+    tweets = store.get_all_tweets(limit=10000, source="like")
     bg.add_task(unliker.bulk_unlike, tweets)
     return {"status": "started", "target_count": len(tweets), "message": f"Started unliking {len(tweets)} tweets on X."}
+
+
+@app.post("/api/maintenance/unbookmark-synced")
+async def maintenance_unbookmark_synced(bg: BackgroundTasks):
+    bookmarks = store.get_all_tweets(limit=10000, source="bookmark")
+    bg.add_task(unliker.bulk_unbookmark, bookmarks)
+    return {"status": "started", "target_count": len(bookmarks), "message": f"Started unbookmarking {len(bookmarks)} tweets on X."}
+
+
+@app.get("/api/maintenance/ghost-sweep/stream")
+async def maintenance_ghost_sweep_stream(limit: int = Query(100, ge=1, le=5000)):
+    return StreamingResponse(
+        scheduler.sweep_ghost_likes_stream(limit=limit),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.get("/api/history/logs")
@@ -250,6 +300,63 @@ async def auth_cookies(payload: dict[str, Any] = Body(...)):
     return {"status": "success", "session": scraper.save_cookies(token, payload.get("ct0", ""), payload.get("username", ""))}
 
 
+@app.post("/api/ingest/url")
+async def ingest_url_endpoint(payload: dict[str, Any] = Body(...)):
+    url = (payload.get("url") or "").strip()
+    if not url:
+        return JSONResponse({"status": "error", "message": "URL is required"}, status_code=400)
+
+    # Check if YouTube URL
+    if "youtube.com" in url or "youtu.be" in url:
+        yt_meta = await ytdlp_client.fetch_video_metadata(url)
+        if not yt_meta:
+            return JSONResponse({"status": "error", "message": "Could not extract YouTube video metadata"}, status_code=404)
+        
+        parsed = parser.parse_youtube_item(yt_meta)
+        parsed["tags"] = tagger.generate_tags(parsed.get("text", ""))
+        try:
+            parsed["vector"] = embedder.embed_text(parsed.get("text", ""))
+        except Exception:
+            parsed["vector"] = [0.0] * 1024
+        
+        store.upsert_tweets([parsed], default_source="youtube")
+        if meili_store.is_healthy():
+            meili_store.upsert_tweets([parsed])
+        
+        history.add_notification(
+            "success",
+            "YouTube Video Ingested",
+            f"Ingested YouTube item: {parsed.get('text', '')[:60]}..."
+        )
+        return {"status": "success", "type": "youtube", "item": parsed}
+
+    # Otherwise treat as Twitter/X URL or ID
+    tweet = await scraper.scrape_single_tweet(url)
+    if not tweet:
+        return JSONResponse({"status": "error", "message": f"Could not extract tweet from {url}. Ensure Twitter account is connected."}, status_code=404)
+
+    tweet["tags"] = tagger.generate_tags(tweet.get("text", ""))
+    try:
+        tweet["vector"] = embedder.embed_text(tweet.get("text", ""))
+    except Exception:
+        tweet["vector"] = [0.0] * 1024
+
+    media_urls = tweet.get("media_urls", [])
+    if media_urls:
+        await media_queue.enqueue(tweet.get("id", ""), media_urls)
+
+    store.upsert_tweets([tweet], default_source="like")
+    if meili_store.is_healthy():
+        meili_store.upsert_tweets([tweet])
+
+    history.add_notification(
+        "success",
+        "Tweet Ingested",
+        f"Saved @{tweet.get('author_handle')}: {tweet.get('text', '')[:60]}..."
+    )
+    return {"status": "success", "type": "tweet", "item": tweet}
+
+
 @app.post("/api/auth/disconnect")
 async def auth_disconnect():
     scraper.disconnect()
@@ -257,11 +364,24 @@ async def auth_disconnect():
 
 
 @app.get("/api/sync/stream")
-async def sync_stream(max_tweets: int = 0, username: str = ""):
+async def sync_stream(max_tweets: int = 0, username: str = "", collection: str = "likes"):
     sched_status = scheduler.get_status()
     auto_unlike = sched_status.get("auto_unlike", True)
+    if collection in ("bookmarks", "bookmark"):
+        return StreamingResponse(
+            stream_bookmarks_sync(scraper, store, tagger, embedder, media_queue, max_tweets, auto_unbookmark=False),
+            media_type="text/event-stream",
+        )
     return StreamingResponse(
         stream_likes_sync(scraper, store, tagger, embedder, media_queue, username, max_tweets, auto_unlike),
+        media_type="text/event-stream",
+    )
+
+
+@app.get("/api/bookmarks/sync/stream")
+async def bookmarks_sync_stream(max_tweets: int = 0, auto_unbookmark: bool = False):
+    return StreamingResponse(
+        stream_bookmarks_sync(scraper, store, tagger, embedder, media_queue, max_tweets, auto_unbookmark),
         media_type="text/event-stream",
     )
 
@@ -274,39 +394,173 @@ async def chat_stream(q: str = Query(..., description="User chat query to LanceD
     )
 
 
+def fuse_rrf_rankings(
+    meili_results: list[dict[str, Any]],
+    lance_results: list[dict[str, Any]],
+    k: int = 60,
+    limit: int = 24,
+) -> list[dict[str, Any]]:
+    """Compute Reciprocal Rank Fusion (RRF) between Meilisearch and LanceDB."""
+    scores: dict[str, float] = {}
+    doc_map: dict[str, dict[str, Any]] = {}
+
+    for rank, doc in enumerate(meili_results):
+        doc_id = str(doc.get("tweet_id") or doc.get("id"))
+        scores[doc_id] = scores.get(doc_id, 0.0) + (1.0 / (k + rank + 1))
+        if doc_id not in doc_map:
+            doc_map[doc_id] = doc
+
+    for rank, doc in enumerate(lance_results):
+        doc_id = str(doc.get("tweet_id") or doc.get("id"))
+        scores[doc_id] = scores.get(doc_id, 0.0) + (1.0 / (k + rank + 1))
+        if doc_id not in doc_map:
+            doc_map[doc_id] = doc
+
+    sorted_ids = sorted(scores.keys(), key=lambda x: -scores[x])
+    fused = [doc_map[doc_id] for doc_id in sorted_ids[:limit] if doc_id in doc_map]
+    return fused
+
+
 @app.get("/api/search")
 async def search_likes(
-    q: str = Query("", description="Search query"),
-    tag: str | None = Query(None, description="Tag filter"),
-    author: str | None = Query(None, description="Author filter"),
-    sort_by: str = Query("newest", description="Sort option"),
-    semantic: bool = Query(False, description="Enable vector semantic search"),
+    q: str = Query("", description="Query string for full-text search"),
+    tag: str | None = Query(None, description="Filter by tag"),
+    author: str | None = Query(None, description="Filter by author handle"),
+    source: str = Query("all", description="Filter by source: all, like, bookmark, youtube"),
+    sort_by: str = Query("newest_liked", description="Sort order"),
+    engine: str = Query("auto", description="Search engine: auto, both, rrf, lancedb, meilisearch"),
+    semantic: bool = Query(False, description="Use deep vector semantic search"),
     offset: int = Query(0, ge=0),
     limit: int = Query(24, ge=1, le=100),
 ):
-    t0 = time.perf_counter()
-    vector = embedder.embed_text(q.strip()) if (semantic and q.strip()) else None
-    
-    # Pushdown author filter if present
     query_text = q.strip()
-    if author:
-        author_clean = author.lstrip("@").strip()
-        if not query_text:
-            query_text = author_clean
+    vector = embedder.embed_text(query_text) if (semantic and query_text) else None
+    
+    lancedb_latency_ms: float | None = None
+    meilisearch_latency_ms: float | None = None
+    results = []
+    lance_results = []
+    meili_results = []
 
-    results = store.search_hybrid(query=query_text, query_vector=vector, tag=tag, sort_by=sort_by, offset=offset, limit=limit)
-    if author:
-        author_clean = author.lstrip("@").lower()
-        results = [r for r in results if (r.get("author_handle") or "").lstrip("@").lower() == author_clean or author_clean in (r.get("author_name") or "").lower()]
+    # 1. LanceDB search
+    if engine in ("lancedb", "both", "rrf", "auto") or semantic:
+        t_lance0 = time.perf_counter()
+        lance_query = query_text
+        if author:
+            author_clean = author.lstrip("@").strip()
+            if not lance_query:
+                lance_query = author_clean
 
-    latency_ms = (time.perf_counter() - t0) * 1000.0
+        lance_results = store.search_hybrid(
+            query=lance_query,
+            query_vector=vector,
+            tag=tag,
+            source=source,
+            sort_by=sort_by,
+            offset=offset,
+            limit=limit,
+        )
+        if author:
+            author_clean = author.lstrip("@").lower()
+            lance_results = [
+                r for r in lance_results
+                if (r.get("author_handle") or "").lstrip("@").lower() == author_clean
+                or author_clean in (r.get("author_name") or "").lower()
+            ]
+        lancedb_latency_ms = (time.perf_counter() - t_lance0) * 1000.0
+        results = lance_results
+
+    # 2. Meilisearch search (when available and not purely vector semantic)
+    if (engine in ("meilisearch", "both", "rrf") or (engine == "auto" and not semantic)) and meili_store.is_healthy():
+        t_meili0 = time.perf_counter()
+        meili_results = meili_store.search(
+            query=query_text,
+            tag=tag,
+            author_handle=author,
+            source=source,
+            sort_by=sort_by,
+            offset=offset,
+            limit=limit,
+        )
+        meilisearch_latency_ms = (time.perf_counter() - t_meili0) * 1000.0
+        if engine == "meilisearch" or (engine == "auto" and not semantic):
+            results = meili_results
+
+    # 3. Hybrid RRF Fusion when 'both' or 'rrf' requested
+    if engine in ("both", "rrf") and lance_results and meili_results:
+        results = fuse_rrf_rankings(meili_results, lance_results, limit=limit)
+
+    if (engine == "meilisearch" or (engine == "auto" and not semantic)) and meilisearch_latency_ms is not None:
+        total_latency_ms = meilisearch_latency_ms
+    else:
+        total_latency_ms = lancedb_latency_ms if lancedb_latency_ms is not None else 0.0
+
     return {
         "count": len(results),
-        "latency_ms": round(latency_ms, 2),
+        "latency_ms": round(total_latency_ms, 2),
+        "lancedb_latency_ms": round(lancedb_latency_ms, 2) if lancedb_latency_ms is not None else None,
+        "meilisearch_latency_ms": round(meilisearch_latency_ms, 2) if meilisearch_latency_ms is not None else None,
+        "engine": engine,
         "semantic": semantic,
         "offset": offset,
         "limit": limit,
         "results": results,
+    }
+
+
+@app.get("/api/authors/leaderboard")
+async def get_authors_leaderboard(
+    source: str = Query("all", description="Source filter: all, like, bookmark, youtube"),
+    sort_by: str = Query("count", description="Sort by: count, recent, name"),
+    limit: int = Query(50, ge=1, le=200),
+):
+    authors = store.get_top_authors(source=source, sort_by=sort_by, limit=limit)
+    return {
+        "count": len(authors),
+        "source": source,
+        "sort_by": sort_by,
+        "authors": authors,
+    }
+
+
+@app.post("/api/maintenance/reconcile-stores")
+async def reconcile_stores_endpoint():
+    lance_items = store.get_all_tweets(limit=10000)
+    lance_count = len(lance_items)
+    synced = 0
+    if meili_store.is_healthy():
+        synced = meili_store.upsert_tweets(lance_items)
+
+    history.add_notification(
+        "success",
+        "Store Parity Reconciled",
+        f"Reconciled LanceDB ({lance_count} items) with Meilisearch ({synced} documents indexed)."
+    )
+    return {
+        "status": "success",
+        "lancedb_count": lance_count,
+        "meilisearch_count": synced,
+        "parity_achieved": True,
+    }
+
+
+@app.get("/manifest.json")
+async def get_pwa_manifest():
+    return {
+        "name": "𝕏 & YouTube Likes Hub",
+        "short_name": "LikesHub",
+        "description": "Blazingly fast AI-powered likes organizer & knowledge archive",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#080b12",
+        "theme_color": "#080b12",
+        "icons": [
+            {
+                "src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%23080b12'/><text y='.9em' font-size='80' x='10'>⚡</text></svg>",
+                "sizes": "192x192 512x512",
+                "type": "image/svg+xml",
+            }
+        ],
     }
 
 
@@ -378,27 +632,112 @@ async def bulk_delete_tweets(payload: dict[str, Any] = Body(...)):
 @app.post("/api/ingest/archive")
 async def ingest_archive(file: UploadFile = File(...)):
     content = await file.read()
-    tweets = parse_like_js_content(content.decode("utf-8", errors="ignore"))
+    raw_text = content.decode("utf-8", errors="ignore")
+    default_src = "bookmark" if "bookmark" in (file.filename or "").lower() else "like"
+    tweets = parse_archive_content(raw_text, default_source=default_src)
     for t in tweets:
         if not t.get("tags"):
             t["tags"] = tagger.generate_tags(t["text"])
-    inserted = store.upsert_tweets(tweets)
-    total_db = store.get_stats().get("total_likes", 0)
-    history.add_sync_log("archive-upload", "parser", "success", len(tweets), total_db, "Imported like.js archive.")
+    inserted = store.upsert_tweets(tweets, default_source=default_src)
+    stats = store.get_stats()
+    total_db = stats.get("total_items", stats.get("total_likes", 0))
+    history.add_sync_log("archive-upload", "parser", "success", len(tweets), total_db, f"Imported {default_src} archive ({len(tweets)} parsed).")
     await telemetry_broadcaster.broadcast("stats", {
         "stats": store.get_stats(),
         "scheduler": scheduler.get_status(),
         "tags_count": len(store.get_all_tags()),
     })
-    return {"status": "success", "parsed": len(tweets), "inserted": inserted}
+    return {"status": "success", "parsed": len(tweets), "inserted": inserted, "source": default_src}
+
+
+@app.post("/api/ingest/youtube/takeout")
+async def ingest_youtube_takeout(file: UploadFile = File(...)):
+    content = await file.read()
+    videos = parse_youtube_takeout_content(content)
+    for v in videos:
+        if not v.get("tags") or v.get("tags") == ["YouTube"]:
+            v["tags"] = tagger.generate_tags(v["text"])
+    inserted = store.upsert_tweets(videos, default_source="youtube")
+    stats = store.get_stats()
+    total_db = stats.get("total_items", stats.get("total_likes", 0))
+    history.add_sync_log("youtube-takeout", "parser", "success", len(videos), total_db, f"Imported {len(videos)} YouTube likes.")
+    await telemetry_broadcaster.broadcast("stats", {
+        "stats": store.get_stats(),
+        "scheduler": scheduler.get_status(),
+        "tags_count": len(store.get_all_tags()),
+    })
+    return {"status": "success", "parsed": len(videos), "inserted": inserted, "source": "youtube"}
+
+
+@app.get("/api/sync/youtube/stream")
+async def stream_youtube_sync_endpoint(api_key: str | None = Query(None), token: str | None = Query(None)):
+    async def event_generator():
+        async for chunk in stream_youtube_sync(api_key=api_key, oauth_token=token):
+            yield f"data: {chunk}\n\n"
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+class YtUrlRequest(BaseModel):
+    url: str
+
+
+@app.post("/api/youtube/ingest-url")
+async def ingest_youtube_url_endpoint(req: YtUrlRequest):
+    extractor = YtDlpExtractor()
+    target_url = req.url.strip()
+    if not target_url:
+        raise HTTPException(status_code=400, detail="Empty URL provided.")
+
+    if "playlist" in target_url or "list=" in target_url:
+        items = extractor.extract_playlist(target_url, max_items=100)
+    else:
+        single = extractor.extract_video(target_url, fetch_subtitles=True)
+        items = [single] if single else []
+
+    if not items:
+        raise HTTPException(status_code=400, detail="Could not extract video metadata from URL.")
+
+    for it in items:
+        if not it.get("tags") or it.get("tags") == ["YouTube"]:
+            it["tags"] = tagger.generate_tags(it["text"])
+
+    inserted = store.upsert_tweets(items, default_source="youtube")
+    stats = store.get_stats()
+    total_db = stats.get("total_items", stats.get("total_likes", 0))
+    history.add_sync_log("youtube-ytdlp", "ytdlp", "success", len(items), total_db, f"Ingested {len(items)} YouTube items via yt-dlp.")
+    await telemetry_broadcaster.broadcast("stats", {
+        "stats": store.get_stats(),
+        "scheduler": scheduler.get_status(),
+        "tags_count": len(store.get_all_tags()),
+    })
+    return {"status": "success", "count": len(items), "inserted": inserted, "items": items}
+
+
+@app.get("/api/youtube/transcript/{video_id}")
+async def get_youtube_transcript_endpoint(video_id: str):
+    segments = get_saved_transcript(video_id)
+    if segments is None:
+        extractor = YtDlpExtractor()
+        extracted = extractor.extract_video(video_id, fetch_subtitles=True)
+        segments = get_saved_transcript(video_id) or []
+    return {"video_id": video_id, "has_transcript": bool(segments), "segments": segments}
+
+
+@app.get("/api/youtube/fetch-transcripts/stream")
+async def stream_fetch_transcripts_endpoint():
+    async def event_generator():
+        async for chunk in stream_batch_fetch_transcripts(store):
+            yield f"data: {chunk}\n\n"
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @app.post("/api/export/markdown")
-async def export_markdown():
+async def export_markdown(source: str = Query("all")):
     export_dir = DATA_DIR / "exports"
-    files = export_tweets_to_directory(store.get_all_tweets(limit=5000), export_dir)
-    history.add_notification("info", "Markdown Export Completed", f"Exported {len(files)} files to {export_dir}.")
-    return {"status": "success", "exported_count": len(files), "export_dir": str(export_dir)}
+    tweets = store.get_all_tweets(limit=10000, source=source)
+    files = export_tweets_to_directory(tweets, export_dir)
+    history.add_notification("info", "Markdown Export Completed", f"Exported {len(files)} files ({source}) to {export_dir}.")
+    return {"status": "success", "exported_count": len(files), "export_dir": str(export_dir), "source": source}
 
 
 @app.get("/api/maintenance/enrich-metrics/stream")
@@ -423,8 +762,13 @@ async def index():
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>𝕏 Likes Organizer HUD</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>𝕏 & YouTube Likes Hub HUD</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#080b12">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="LikesHub">
+  <link rel="manifest" href="/manifest.json">
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
@@ -474,6 +818,20 @@ async def index():
     
     .sync-select, .sort-select {{ background: #131926; color: var(--text); border: 1px solid var(--card-border); padding: 0.35rem 0.55rem; border-radius: 6px; font-size: 0.75rem; font-family: 'JetBrains Mono', monospace; outline: none; }}
     
+    /* Collection Filter Tabs */
+    .collection-tabs-bar {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 0.25rem; }}
+    .collection-tab {{ background: rgba(255, 255, 255, 0.04); color: var(--muted); border: 1px solid var(--card-border); padding: 0.4rem 0.85rem; border-radius: 8px; cursor: pointer; font-size: 0.82rem; font-weight: 600; display: inline-flex; align-items: center; gap: 8px; transition: all 0.2s ease; outline: none; }}
+    .collection-tab:hover {{ background: rgba(255, 255, 255, 0.1); color: #fff; border-color: rgba(255, 255, 255, 0.25); }}
+    .collection-tab.active {{ background: rgba(29, 155, 240, 0.2); color: #38bdf8; border-color: #0284c7; box-shadow: 0 0 12px rgba(56, 189, 248, 0.3); }}
+    .tab-badge {{ background: rgba(0, 0, 0, 0.45); padding: 2px 7px; border-radius: 999px; font-size: 0.72rem; font-family: 'JetBrains Mono', monospace; color: #cbd5e1; border: 1px solid rgba(255, 255, 255, 0.1); }}
+    .collection-tab.active .tab-badge {{ background: rgba(56, 189, 248, 0.25); color: #fff; border-color: rgba(56, 189, 248, 0.4); }}
+
+    /* Source Badges */
+    .source-badge {{ font-size: 0.68rem; padding: 1px 6px; border-radius: 4px; font-weight: 600; font-family: 'JetBrains Mono', monospace; display: inline-flex; align-items: center; gap: 4px; }}
+    .source-badge.like {{ background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.35); }}
+    .source-badge.bookmark {{ background: rgba(59, 130, 246, 0.15); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.35); }}
+    .source-badge.both {{ background: rgba(168, 85, 247, 0.15); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.35); }}
+
     /* Blazingly Fast HUD Filter Capsule */
     .hud-filter-dock {{ background: var(--card-bg); backdrop-filter: blur(12px); border: 1px solid var(--card-border); border-radius: 12px; padding: 1rem 1.25rem; margin-bottom: 1.5rem; display: flex; flex-direction: column; gap: 0.85rem; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4); }}
     .search-row {{ display: flex; gap: 0.6rem; align-items: center; }}
@@ -556,19 +914,53 @@ async def index():
     .gallery-body {{ padding: 0.85rem; }}
 
     /* Fullscreen Glassmorphic Tweet Detail Lightbox Modal */
-    .hud-modal-backdrop {{ position: fixed; inset: 0; background: rgba(3, 5, 10, 0.85); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); z-index: 200; display: none; align-items: center; justify-content: center; padding: 1.5rem; }}
-    .hud-modal-backdrop.open {{ display: flex; }}
-    .hud-modal-box {{ background: rgba(13, 17, 28, 0.95); border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 16px; width: 100%; max-width: 760px; max-height: 90vh; overflow-y: auto; display: flex; flex-direction: column; box-shadow: 0 25px 60px rgba(0, 0, 0, 0.9); animation: modalIn 0.2s cubic-bezier(0.16, 1, 0.3, 1); }}
-    @keyframes modalIn {{ from {{ opacity: 0; transform: scale(0.96); }} to {{ opacity: 1; transform: scale(1); }} }}
-    .hud-modal-header {{ padding: 1.25rem 1.5rem; border-bottom: 1px solid var(--card-border); display: flex; justify-content: space-between; align-items: center; }}
-    .hud-modal-body {{ padding: 1.5rem; display: flex; flex-direction: column; gap: 1.25rem; }}
-    .hud-modal-media {{ display: flex; flex-direction: column; gap: 0.75rem; }}
-    .hud-modal-img {{ width: 100%; max-height: 480px; object-fit: contain; background: #000; border-radius: 10px; border: 1px solid var(--card-border); }}
-    .hud-modal-actions {{ display: flex; flex-wrap: wrap; gap: 8px; padding-top: 1rem; border-top: 1px solid var(--card-border); }}
-    
-    /* Similar Tweets Cards inside Modal */
-    .similar-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.65rem; margin-top: 0.5rem; }}
-    .similar-card {{ background: rgba(0, 0, 0, 0.4); border: 1px solid var(--card-border); border-radius: 8px; padding: 0.75rem; cursor: pointer; display: flex; flex-direction: column; justify-content: space-between; gap: 6px; transition: all 0.15s ease; }}
+    .hud-modal-backdrop {{
+      position: fixed;
+      inset: 0;
+      background: rgba(4, 6, 12, 0.85);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      z-index: 1000;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 1.5rem;
+    }}
+    .hud-modal-backdrop.open {{
+      display: flex !important;
+    }}
+    .hud-modal-box {{
+      background: rgba(11, 15, 25, 0.96);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 16px;
+      max-width: 680px;
+      width: 100%;
+      max-height: 85vh;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.85);
+      overflow: hidden;
+    }}
+    .hud-modal-header {{
+      padding: 1rem 1.25rem;
+      border-bottom: 1px solid var(--card-border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }}
+    .hud-modal-body {{
+      padding: 1.25rem;
+      overflow-y: auto;
+      flex: 1;
+    }}
+    .hud-modal-actions {{
+      padding: 1rem 1.25rem;
+      border-top: 1px solid var(--card-border);
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      background: rgba(8, 11, 18, 0.6);
+    }}
     .similar-card:hover {{ border-color: var(--primary); transform: translateY(-2px); background: rgba(29, 155, 240, 0.05); }}
     .similar-card-header {{ display: flex; align-items: center; justify-content: space-between; font-size: 0.75rem; }}
     .similar-card-text {{ font-size: 0.78rem; line-height: 1.35; color: #cbd5e1; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }}
@@ -576,14 +968,47 @@ async def index():
     /* Like Count Badge */
     .like-badge {{ display: inline-flex; align-items: center; gap: 4px; font-size: 0.72rem; color: #f43f5e; background: rgba(244, 63, 94, 0.12); border: 1px solid rgba(244, 63, 94, 0.28); padding: 2px 7px; border-radius: 999px; font-weight: 600; font-family: 'JetBrains Mono', monospace; }}
 
+    /* Author Leaderboard Cards */
+    .author-rank-card {{
+      background: rgba(15, 23, 42, 0.6);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 0.75rem 0.9rem;
+      margin-bottom: 0.65rem;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }}
+    .author-rank-card:hover {{
+      border-color: rgba(56, 189, 248, 0.4);
+      background: rgba(15, 23, 42, 0.85);
+      transform: translateY(-1px);
+    }}
+    .rank-badge {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 26px;
+      height: 26px;
+      border-radius: 6px;
+      font-size: 0.75rem;
+      font-weight: 800;
+      font-family: 'JetBrains Mono', monospace;
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--muted);
+      border: 1px solid var(--card-border);
+    }}
+    .rank-1 {{ background: rgba(245, 158, 11, 0.2); color: #fbbf24; border-color: #f59e0b; }}
+    .rank-2 {{ background: rgba(148, 163, 184, 0.2); color: #e2e8f0; border-color: #94a3b8; }}
+    .rank-3 {{ background: rgba(217, 119, 6, 0.2); color: #d97706; border-color: #b45309; }}
+
     /* Shimmer Skeleton */
     .skeleton {{ background: linear-gradient(90deg, #101524 25%, #192238 50%, #101524 75%); background-size: 200% 100%; animation: shimmer 1.5s infinite; border-radius: 6px; }}
     @keyframes shimmer {{ 0% {{ background-position: 200% 0; }} 100% {{ background-position: -200% 0; }} }}
     .skeleton-card {{ background: var(--card-bg); border: 1px solid var(--card-border); padding: 1.25rem; border-radius: 12px; }}
 
     /* Sliding HUD Right Sidesheet */
-    .hud-sidesheet {{ position: fixed; top: 76px; bottom: 16px; right: 16px; width: 420px; background: rgba(11, 15, 25, 0.92); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 16px; z-index: 120; display: flex; flex-direction: column; box-shadow: -10px 0 40px rgba(0, 0, 0, 0.7); transform: translateX(460px); transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1); }}
-    .hud-sidesheet.open {{ transform: translateX(0); }}
+    .hud-sidesheet {{ position: fixed; top: 76px; bottom: 16px; right: 16px; width: 420px; background: rgba(11, 15, 25, 0.92); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 16px; z-index: 800; display: none; flex-direction: column; box-shadow: -10px 0 40px rgba(0, 0, 0, 0.7); transform: translateX(460px); transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1); }}
+    .hud-sidesheet.open {{ display: flex !important; transform: translateX(0); }}
     .hud-sidesheet-header {{ padding: 16px 20px; border-bottom: 1px solid var(--card-border); display: flex; align-items: center; justify-content: space-between; }}
     .hud-tabs {{ display: flex; gap: 8px; padding: 12px 16px 0; border-bottom: 1px solid var(--card-border); }}
     .hud-tab {{ padding: 8px 12px; cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent; font-size: 0.85rem; font-weight: 600; }}
@@ -591,8 +1016,8 @@ async def index():
     .hud-sidesheet-content {{ flex: 1; overflow-y: auto; padding: 16px; font-size: 0.85rem; }}
 
     /* Sliding HUD RAG Chat Drawer */
-    .hud-chat-drawer {{ position: fixed; top: 76px; bottom: 16px; left: 16px; width: 460px; background: rgba(11, 15, 25, 0.94); backdrop-filter: blur(22px); -webkit-backdrop-filter: blur(22px); border: 1px solid rgba(99, 102, 241, 0.35); border-radius: 16px; z-index: 120; display: flex; flex-direction: column; box-shadow: 10px 0 40px rgba(0, 0, 0, 0.75); transform: translateX(-500px); transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1); }}
-    .hud-chat-drawer.open {{ transform: translateX(0); }}
+    .hud-chat-drawer {{ position: fixed; top: 76px; bottom: 16px; left: 16px; width: 460px; background: rgba(11, 15, 25, 0.94); backdrop-filter: blur(22px); -webkit-backdrop-filter: blur(22px); border: 1px solid rgba(99, 102, 241, 0.35); border-radius: 16px; z-index: 800; display: none; flex-direction: column; box-shadow: 10px 0 40px rgba(0, 0, 0, 0.75); transform: translateX(-500px); transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1); }}
+    .hud-chat-drawer.open {{ display: flex !important; transform: translateX(0); }}
     .chat-messages {{ flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; font-size: 0.85rem; }}
     .chat-msg {{ padding: 10px 14px; border-radius: 10px; line-height: 1.4; max-width: 90%; }}
     .chat-msg.user {{ align-self: flex-end; background: linear-gradient(135deg, #1d9bf0, #4f46e5); color: #fff; border-bottom-right-radius: 2px; }}
@@ -604,7 +1029,7 @@ async def index():
     .chat-input-row {{ padding: 12px 16px; border-top: 1px solid var(--card-border); display: flex; gap: 8px; background: rgba(8, 11, 18, 0.8); border-radius: 0 0 16px 16px; }}
     
     /* Non-blocking Floating Sync Toast */
-    .hud-floating-toast {{ position: fixed; bottom: 1.5rem; right: 1.5rem; background: rgba(11, 15, 25, 0.95); backdrop-filter: blur(16px); border: 1px solid rgba(29, 155, 240, 0.4); box-shadow: 0 10px 30px rgba(0,0,0,0.8); border-radius: 12px; width: 340px; z-index: 95; display: none; overflow: hidden; font-size: 0.85rem; }}
+    .hud-floating-toast {{ position: fixed; bottom: 2rem; right: 2rem; background: rgba(11, 15, 25, 0.95); backdrop-filter: blur(16px); border: 1px solid rgba(29, 155, 240, 0.4); box-shadow: 0 10px 30px rgba(0,0,0,0.8); border-radius: 12px; width: 340px; z-index: 600; display: none; overflow: hidden; font-size: 0.85rem; }}
     .toast-header {{ padding: 0.65rem 0.9rem; display: flex; justify-content: space-between; align-items: center; background: rgba(29, 155, 240, 0.1); border-bottom: 1px solid var(--card-border); }}
     .toast-body {{ padding: 0.75rem 0.9rem; }}
     .toast-progress {{ background: #131926; height: 6px; border-radius: 3px; overflow: hidden; margin-top: 0.5rem; }}
@@ -612,7 +1037,7 @@ async def index():
     .toast-log {{ font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: var(--muted); max-height: 90px; overflow-y: auto; margin-top: 0.5rem; }}
     .hud-btn {{ background: rgba(255, 255, 255, 0.06); color: var(--text); border: 1px solid var(--card-border); padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; font-size: 0.8rem; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; transition: all 0.2s ease; min-height: 38px; }}
     .hud-btn:hover {{ background: rgba(255, 255, 255, 0.12); border-color: rgba(255, 255, 255, 0.25); }}
-    .hud-bulk-bar {{ position: fixed; bottom: 2rem; left: 50%; transform: translateX(-50%); background: rgba(15, 23, 42, 0.94); backdrop-filter: blur(16px); border: 1px solid var(--primary); border-radius: 9999px; padding: 0.6rem 1.25rem; display: flex; align-items: center; justify-content: space-between; gap: 1.25rem; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.7), 0 0 20px rgba(56, 189, 248, 0.25); z-index: 1000; max-width: 92vw; }}
+    .hud-bulk-bar {{ position: fixed; bottom: 2rem; left: 50%; transform: translateX(-50%); background: rgba(15, 23, 42, 0.94); backdrop-filter: blur(16px); border: 1px solid var(--primary); border-radius: 9999px; padding: 0.6rem 1.25rem; display: flex; align-items: center; justify-content: space-between; gap: 1.25rem; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.7), 0 0 20px rgba(56, 189, 248, 0.25); z-index: 500; max-width: 92vw; }}
     .tweet-checkbox {{ position: absolute; top: 12px; left: 12px; width: 18px; height: 18px; accent-color: var(--primary); cursor: pointer; z-index: 5; display: none; }}
     .is-selecting .tweet-checkbox {{ display: block !important; }}
     .is-selecting .hud-tweet-card, .is-selecting .gallery-card, .is-selecting .compact-row {{ position: relative; }}
@@ -648,20 +1073,133 @@ async def index():
         max-height: 85vh !important;
         border-radius: 20px 20px 0 0 !important;
         border-bottom: none !important;
+        display: none;
         transform: translateY(105%) !important;
         box-shadow: 0 -10px 40px rgba(0, 0, 0, 0.85) !important;
       }}
       .hud-chat-drawer.open, .hud-sidesheet.open {{
+        display: flex !important;
         transform: translateY(0) !important;
       }}
 
-      /* Mobile Modal */
+      /* Mobile Bottom Sheet Modal & Drawers */
       .hud-modal-backdrop {{ padding: 0; align-items: flex-end; }}
       .hud-modal-box {{ max-height: 90vh; border-radius: 20px 20px 0 0; width: 100%; border-bottom: none; }}
       .hud-modal-actions {{ flex-direction: column; }}
-      .hud-modal-actions .hud-btn {{ width: 100%; justify-content: center; }}
-      
-      .hud-floating-toast {{ left: 1rem; right: 1rem; width: auto; bottom: 1rem; }}
+      /* Mobile Floating Widgets Non-Colliding Offsets */
+      .hud-bulk-bar {{
+        bottom: calc(66px + env(safe-area-inset-bottom, 8px)) !important;
+        z-index: 500 !important;
+      }}
+      .hud-floating-toast {{
+        left: 0.75rem !important;
+        right: 0.75rem !important;
+        width: auto !important;
+        bottom: calc(130px + env(safe-area-inset-bottom, 8px)) !important;
+        z-index: 600 !important;
+      }}
+      .toast-container {{
+        top: 60px !important;
+        right: 12px !important;
+        left: 12px !important;
+        z-index: 950 !important;
+      }}
+
+      body {{
+        padding-bottom: calc(70px + env(safe-area-inset-bottom, 12px)) !important;
+      }}
+      .hud-mobile-dock {{
+        display: flex !important;
+        position: fixed;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        height: calc(58px + env(safe-area-inset-bottom, 8px));
+        padding-bottom: env(safe-area-inset-bottom, 8px);
+        background: rgba(10, 14, 23, 0.92);
+        backdrop-filter: blur(20px);
+        -webkit-backdrop-filter: blur(20px);
+        border-top: 1px solid rgba(255, 255, 255, 0.1);
+        z-index: 100;
+        align-items: center;
+        justify-content: space-around;
+        box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.7);
+      }}
+      .mob-nav-item {{
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        background: transparent;
+        border: none;
+        color: var(--muted);
+        font-size: 0.65rem;
+        font-weight: 600;
+        padding: 4px 8px;
+        min-width: 44px;
+        min-height: 44px;
+        cursor: pointer;
+        transition: color 0.15s ease, transform 0.15s ease;
+        position: relative;
+        outline: none;
+        -webkit-tap-highlight-color: transparent;
+      }}
+      .mob-nav-item svg {{
+        width: 19px;
+        height: 19px;
+        margin-bottom: 2px;
+        stroke-width: 2;
+        fill: none;
+        stroke: currentColor;
+      }}
+      .mob-nav-item.active {{
+        color: #38bdf8;
+      }}
+      .mob-nav-item:active {{
+        transform: scale(0.92);
+      }}
+      .mob-nav-badge {{
+        position: absolute;
+        top: 2px;
+        right: 4px;
+        background: #38bdf8;
+        color: #0f172a;
+        font-size: 0.58rem;
+        font-weight: 800;
+        border-radius: 999px;
+        padding: 1px 4px;
+        font-family: 'JetBrains Mono', monospace;
+      }}
+
+      /* Pull-to-refresh Visual Indicator */
+      #hud-pull-indicator {{
+        position: fixed;
+        top: 65px;
+        left: 50%;
+        transform: translateX(-50%) translateY(-60px);
+        width: 38px;
+        height: 38px;
+        border-radius: 50%;
+        background: rgba(15, 23, 42, 0.95);
+        border: 1px solid rgba(56, 189, 248, 0.4);
+        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.6), 0 0 15px rgba(56, 189, 248, 0.3);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #38bdf8;
+        z-index: 9999;
+        transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.2s ease;
+        opacity: 0;
+        pointer-events: none;
+      }}
+      #hud-pull-indicator.pulling {{
+        opacity: 1;
+      }}
+      #hud-pull-indicator.refreshing {{
+        opacity: 1;
+        transform: translateX(-50%) translateY(20px);
+        animation: spin 0.8s linear infinite;
+      }}
     }}
 
     @keyframes statPulse {{
@@ -703,9 +1241,208 @@ async def index():
       transform: translateX(-50%) scale(1.04);
       box-shadow: 0 10px 28px rgba(29,155,240,0.6);
     }}
+
+    /* Zen Mode & HUD Transitions (hud-design style) */
+    .hud-topbar,
+    .hud-filter-dock,
+    .hud-chat-drawer,
+    .hud-sidesheet {{
+      transition: opacity 0.3s cubic-bezier(0.4, 0, 0.2, 1), transform 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
+    }}
+
+    body.workspace-fullscreen--zen {{
+      padding-top: 1.5rem !important;
+    }}
+
+    .workspace-fullscreen--zen .hud-topbar {{
+      opacity: 0 !important;
+      pointer-events: none !important;
+      transform: translateY(-100%) !important;
+    }}
+
+    .workspace-fullscreen--zen .hud-filter-dock {{
+      opacity: 0 !important;
+      pointer-events: none !important;
+      transform: translateY(-20px) !important;
+      margin-bottom: 0 !important;
+      max-height: 0 !important;
+      padding: 0 !important;
+      overflow: hidden !important;
+      border: none !important;
+    }}
+
+    .workspace-fullscreen--zen .hud-chat-drawer {{
+      opacity: 0 !important;
+      pointer-events: none !important;
+      transform: translateX(-100%) !important;
+    }}
+
+    .workspace-fullscreen--zen .hud-sidesheet {{
+      opacity: 0 !important;
+      pointer-events: none !important;
+      transform: translateX(100%) !important;
+    }}
+
+    /* Floating Zen Mode Exit Pill */
+    #hud-zen-exit-pill {{
+      position: fixed;
+      top: 16px;
+      right: 20px;
+      z-index: 1000;
+      background: rgba(11, 15, 25, 0.85);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 0.75rem;
+      padding: 6px 14px;
+      border-radius: 999px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+      cursor: pointer;
+      display: none;
+      align-items: center;
+      gap: 8px;
+      opacity: 0.25;
+      transition: all 0.25s ease;
+    }}
+    #hud-zen-exit-pill:hover {{
+      opacity: 1;
+      color: #fff;
+      border-color: rgba(29, 155, 240, 0.5);
+      transform: scale(1.03);
+      box-shadow: 0 8px 24px rgba(29, 155, 240, 0.3);
+    }}
+    .workspace-fullscreen--zen #hud-zen-exit-pill {{
+      display: inline-flex;
+    }}
+
+    /* Command Palette Styles */
+    .cmd-palette-backdrop {{
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0, 0, 0, 0.75);
+      backdrop-filter: blur(12px);
+      z-index: 99999;
+      display: none;
+      align-items: flex-start;
+      justify-content: center;
+      padding-top: 14vh;
+    }}
+    .cmd-palette-backdrop.open {{ display: flex; }}
+    .cmd-palette-box {{
+      background: rgba(13, 17, 23, 0.95);
+      border: 1px solid rgba(56, 189, 248, 0.35);
+      box-shadow: 0 16px 50px rgba(0, 0, 0, 0.8), 0 0 35px rgba(56, 189, 248, 0.25);
+      border-radius: 12px;
+      width: 100%;
+      max-width: 580px;
+      overflow: hidden;
+    }}
+    .cmd-palette-input-row {{
+      display: flex;
+      align-items: center;
+      padding: 0.85rem 1rem;
+      border-bottom: 1px solid var(--card-border);
+      gap: 10px;
+    }}
+    .cmd-palette-input {{
+      background: transparent;
+      border: none;
+      outline: none;
+      color: #fff;
+      font-size: 1rem;
+      flex: 1;
+    }}
+    .cmd-palette-list {{
+      max-height: 340px;
+      overflow-y: auto;
+      padding: 0.5rem;
+    }}
+    .cmd-item {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.65rem 0.85rem;
+      border-radius: 6px;
+      cursor: pointer;
+      color: #cbd5e1;
+      font-size: 0.88rem;
+      transition: all 0.15s ease;
+    }}
+    .cmd-item:hover, .cmd-item.selected {{
+      background: rgba(56, 189, 248, 0.18);
+      color: #38bdf8;
+    }}
+    .cmd-key-badge {{
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 0.72rem;
+      font-family: 'JetBrains Mono', monospace;
+      color: var(--muted);
+    }}
+
+    /* Toast Notification Component (hud-design style) */
+    .toast-container {{
+      position: fixed;
+      top: 70px;
+      right: 20px;
+      z-index: 9999;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      pointer-events: none;
+    }}
+    .toast {{
+      pointer-events: auto;
+      min-width: 280px;
+      max-width: 440px;
+      padding: 10px 16px;
+      border-radius: 10px;
+      font-size: 0.85rem;
+      font-weight: 500;
+      color: #fff;
+      background: rgba(15, 23, 42, 0.92);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.1);
+      border-left: 4px solid #3b82f6;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      animation: slideInRight 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+      transition: opacity 0.3s ease, transform 0.3s ease;
+    }}
+    .toast--warning {{ border-left-color: #f59e0b; color: #fef3c7; }}
+    .toast--error {{ border-left-color: #ef4444; color: #fecaca; }}
+    .toast--info {{ border-left-color: #3b82f6; color: #dbeafe; }}
+    .toast--success {{ border-left-color: #10b981; color: #d1fae5; }}
+    .toast__close {{
+      background: none;
+      border: none;
+      color: rgba(255, 255, 255, 0.6);
+      font-size: 1.1rem;
+      cursor: pointer;
+      padding: 0 4px;
+      line-height: 1;
+    }}
+    .toast__close:hover {{ color: #fff; }}
+    @keyframes slideInRight {{
+      from {{ transform: translateX(100%); opacity: 0; }}
+      to {{ transform: translateX(0); opacity: 1; }}
+    }}
   </style>
 </head>
 <body>
+  <!-- Floating Zen Mode Exit Pill -->
+  <div id="hud-zen-exit-pill" onclick="toggleZenMode(false)" title="Exit Zen Mode [Z or Esc]">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M4 14h6v6"/><path d="M20 10h-6V4"/><path d="M14 10l7-7"/><path d="M3 21l7-7"/></svg>
+    <span>Exit Zen Mode <kbd style="background:rgba(255,255,255,0.15); padding:1px 5px; border-radius:4px; font-size:0.7rem; font-family:'JetBrains Mono',monospace;">Z</kbd></span>
+  </div>
+
   <!-- Floating New Likes Pill -->
   <div id="hud-new-likes-pill" onclick="refreshFeedFromPill()">
     <span>✨</span>
@@ -738,6 +1475,11 @@ async def index():
 
     <!-- Pure HUD SVG Icon Deck -->
     <div class="hud-deck">
+      <!-- Zen Mode Button -->
+      <button id="btn-toggle-zen" class="hud-icon-btn" onclick="toggleZenMode()" title="Toggle Clean View / Zen Mode [Z]">
+        <svg viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
+      </button>
+
       <!-- Chat with LanceDB RAG Button -->
       <button id="btn-chat-icon" class="hud-icon-btn accent" onclick="toggleChatDrawer()" title="Chat with LanceDB (AI RAG)">
         <svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
@@ -765,6 +1507,26 @@ async def index():
   <div class="container">
     <!-- Blazingly Fast Filter Dock -->
     <div class="hud-filter-dock">
+      <!-- Collection Filter Tabs Bar -->
+      <div class="collection-tabs-bar">
+        <button id="tab-col-all" class="collection-tab active" onclick="setCollectionFilter('all')">
+          <span>🌐 All</span>
+          <span class="tab-badge" id="badge-count-all">{stats.get('total_items', stats.get('total_likes', 0))}</span>
+        </button>
+        <button id="tab-col-likes" class="collection-tab" onclick="setCollectionFilter('like')">
+          <span>❤️ 𝕏 Likes</span>
+          <span class="tab-badge" id="badge-count-likes">{stats.get('total_likes', 0)}</span>
+        </button>
+        <button id="tab-col-bookmarks" class="collection-tab" onclick="setCollectionFilter('bookmark')">
+          <span>🔖 𝕏 Bookmarks</span>
+          <span class="tab-badge" id="badge-count-bookmarks">{stats.get('total_bookmarks', 0)}</span>
+        </button>
+        <button id="tab-col-youtube" class="collection-tab" onclick="setCollectionFilter('youtube')">
+          <span>▶️ YouTube</span>
+          <span class="tab-badge" id="badge-count-youtube">{stats.get('total_youtube', 0)}</span>
+        </button>
+      </div>
+
       <div class="search-row">
         <div class="search-capsule">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
@@ -775,6 +1537,14 @@ async def index():
         <button id="btn-semantic-toggle" class="semantic-toggle-btn" onclick="toggleSemanticMode()" title="Toggle Deep Vector AI Semantic Search">
           <span>🧠 AI Semantic</span>
         </button>
+
+        <!-- Search Engine Selector -->
+        <select id="select-engine" class="sort-select" onchange="changeEngine(this.value)" title="Search Engine: Auto Optimal, Compare Both, Meilisearch, or LanceDB">
+          <option value="auto">⚡ Auto (Optimal Hybrid)</option>
+          <option value="both">📊 Compare (Lance + Meili)</option>
+          <option value="meilisearch">🚀 Meilisearch Only</option>
+          <option value="lancedb">🔷 LanceDB Only</option>
+        </select>
 
         <span id="latency-indicator" class="latency-badge">⚡ &lt;2ms</span>
       </div>
@@ -838,6 +1608,7 @@ async def index():
           <span style="font-size:1.1rem;">𝕏</span>
           <h3 id="modal-author-name" style="font-size:0.95rem; font-weight:700;">Tweet Detail</h3>
           <span id="modal-author-handle" style="color:var(--muted); font-family:'JetBrains Mono',monospace; font-size:0.85rem;"></span>
+          <span id="modal-source-badge" class="source-badge"></span>
           <span id="modal-likes-count" class="like-badge" style="display:none;">❤️ 0</span>
         </div>
         <button class="hud-icon-btn" onclick="closeTweetModal()" style="width:28px; height:28px;">✕</button>
@@ -847,11 +1618,22 @@ async def index():
         <div id="modal-media-container" class="hud-modal-media"></div>
         <div id="modal-tags-container" style="display:flex; flex-wrap:wrap; gap:6px;"></div>
         
+        <!-- 📝 Synced Video Transcript & Moments Section -->
+        <div id="modal-transcript-section" style="display:none; margin-top:1rem; border-top:1px solid var(--card-border); padding-top:1rem;">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.6rem;">
+            <span style="font-size:0.85rem; font-weight:700; color:#e2e8f0; display:flex; align-items:center; gap:6px;">
+              <span>📝</span> Synced Video Transcript & Moments
+            </span>
+            <span id="modal-transcript-indicator" style="font-size:0.72rem; color:var(--muted); font-family:'JetBrains Mono',monospace;"></span>
+          </div>
+          <div id="modal-transcript-container" style="max-height:220px; overflow-y:auto; background:rgba(8,11,18,0.7); border:1px solid var(--card-border); border-radius:8px; padding:0.75rem; font-size:0.82rem; line-height:1.6;"></div>
+        </div>
+
         <!-- ✨ Similar Likes Section -->
         <div id="modal-similar-section" style="margin-top:1rem; border-top:1px solid var(--card-border); padding-top:1rem;">
           <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.6rem;">
             <span style="font-size:0.85rem; font-weight:700; color:#e2e8f0; display:flex; align-items:center; gap:6px;">
-              <span>✨</span> Similar Likes You Might Enjoy
+              <span>✨</span> Similar Tweets You Might Enjoy
             </span>
             <span id="similar-loading-indicator" style="font-size:0.72rem; color:var(--muted); font-family:'JetBrains Mono',monospace;"></span>
           </div>
@@ -864,7 +1646,8 @@ async def index():
           <a id="modal-open-x-btn" href="#" target="_blank" class="hud-btn" style="text-decoration:none;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg> Open on 𝕏</a>
           <button id="modal-filter-author-btn" class="hud-btn"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg> Filter by Author</button>
           <button id="modal-unlike-btn" class="hud-btn" style="background:rgba(239,68,68,0.15); border-color:#ef4444; color:#f87171;" onclick="unlikeActiveModalTweet()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/><path d="m12 5-1 4 2 3-2 4"/></svg> Unlike on 𝕏</button>
-          <button id="modal-delete-btn" class="hud-btn" style="background:rgba(239,68,68,0.15); border-color:#ef4444; color:#f87171;" onclick="confirmDeleteCurrentModalTweet()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg> Delete Saved Like</button>
+          <button id="modal-unbookmark-btn" class="hud-btn" style="background:rgba(59,130,246,0.15); border-color:#3b82f6; color:#60a5fa;" onclick="unbookmarkActiveModalTweet()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg> Un-bookmark on 𝕏</button>
+          <button id="modal-delete-btn" class="hud-btn" style="background:rgba(239,68,68,0.15); border-color:#ef4444; color:#f87171;" onclick="confirmDeleteCurrentModalTweet()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg> Delete Saved Item</button>
         </div>
       </div>
     </div>
@@ -886,7 +1669,7 @@ async def index():
     <div class="chat-messages" id="chat-messages-container">
       <div class="chat-msg assistant">
         <strong>👋 Assistant</strong><br>
-        Ask anything across your 3,300+ likes! I search your local LanceDB vectors and synthesize answers with citations.
+        Ask anything across your likes and bookmarks! I search your local LanceDB vectors and synthesize answers with citations.
         <div style="display:flex; flex-wrap:wrap; gap:6px; margin-top:10px;">
           <span class="chat-chip" onclick="askPreset('What did Karpathy or DHH tweet about AI agents and code?')">🤖 Karpathy on AI Agents</span>
           <span class="chat-chip" onclick="askPreset('Summarize the top frontend and UI libraries I liked')">🎨 Top UI Libraries</span>
@@ -897,7 +1680,7 @@ async def index():
 
     <!-- Chat Input Form -->
     <div class="chat-input-row">
-      <input type="text" id="chat-input" class="hud-input" placeholder="Ask a question about your likes..." onkeyup="if(event.key==='Enter') sendChatMessage()" style="background:#080b12;">
+      <input type="text" id="chat-input" class="hud-input" placeholder="Ask a question about your saved tweets..." onkeyup="if(event.key==='Enter') sendChatMessage()" style="background:#080b12;">
       <button class="hud-btn accent" onclick="sendChatMessage()" id="btn-chat-send" style="padding:0.5rem 1rem;">Send</button>
     </div>
   </aside>
@@ -911,12 +1694,29 @@ async def index():
     </div>
     <div class="hud-tabs">
       <div class="hud-tab active" id="tab-btn-logs" onclick="switchHistTab('logs')">Sync Logs</div>
+      <div class="hud-tab" id="tab-btn-authors" onclick="switchHistTab('authors')">👑 Top Authors</div>
       <div class="hud-tab" id="tab-btn-notifs" onclick="switchHistTab('notifs')">Alerts</div>
       <div class="hud-tab" id="tab-btn-settings" onclick="switchHistTab('settings')">Settings</div>
     </div>
     <div class="hud-sidesheet-content">
       <div id="tab-logs">
         <div id="logs-container">Loading telemetry...</div>
+      </div>
+      <div id="tab-authors" style="display:none;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem; gap:8px;">
+          <select id="author-source-select" class="sort-select" onchange="loadTopAuthors()" style="flex:1;">
+            <option value="all">🌐 All Sources</option>
+            <option value="like">❤️ 𝕏 Likes</option>
+            <option value="bookmark">🔖 𝕏 Bookmarks</option>
+            <option value="youtube">▶️ YouTube</option>
+          </select>
+          <select id="author-sort-select" class="sort-select" onchange="loadTopAuthors()" style="flex:1;">
+            <option value="count">🔥 Most Liked</option>
+            <option value="recent">⏱️ Most Recent</option>
+            <option value="name">🔤 Name (A-Z)</option>
+          </select>
+        </div>
+        <div id="authors-container">Loading leaderboard...</div>
       </div>
       <div id="tab-notifs" style="display:none;">
         <div style="display:flex; justify-content:flex-end; margin-bottom:0.75rem;">
@@ -943,7 +1743,7 @@ async def index():
           <div class="settings-row">
             <div>
               <div class="settings-label">Sync Cycle Interval</div>
-              <div class="settings-desc">Frequency of automated likes ingestion</div>
+              <div class="settings-desc">Frequency of automated likes & bookmarks ingestion</div>
             </div>
             <select id="setting-interval" class="sync-select" onchange="changeSyncInterval(this.value)">
               <option value="300" {'selected' if sched['interval_sec'] == 300 else ''}>Every 5 minutes</option>
@@ -1034,23 +1834,56 @@ async def index():
           <div style="display:flex; flex-direction:column; gap:8px;">
             <button class="hud-btn" onclick="document.getElementById('file-upload').click()" style="justify-content:center;">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-              Import Twitter like.js Archive
+              Import Twitter Archive (like.js / bookmarks.js)
             </button>
             <input type="file" id="file-upload" style="display:none" onchange="uploadArchive(this)">
 
+            <button class="hud-btn" onclick="document.getElementById('youtube-file-upload').click()" style="justify-content:center; background:rgba(239,68,68,0.12); border-color:#ef4444; color:#f87171;">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/></svg>
+              Import YouTube Takeout (JSON / CSV)
+            </button>
+            <input type="file" id="youtube-file-upload" style="display:none" onchange="uploadYouTubeTakeout(this)">
+
+            <!-- yt-dlp Video / Playlist URL Extractor -->
+            <div style="background:rgba(239,68,68,0.06); border:1px solid rgba(239,68,68,0.25); border-radius:8px; padding:0.65rem; display:flex; flex-direction:column; gap:6px;">
+              <div style="font-size:0.78rem; font-weight:700; color:#f87171; display:flex; align-items:center; gap:6px;">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/></svg>
+                yt-dlp Extractor (No Video Download)
+              </div>
+              <input type="text" id="ytdlp-url-input" class="hud-input" placeholder="YouTube Video / Playlist URL..." style="width:100%; font-size:0.8rem; background:#080b12;">
+              <div style="display:flex; gap:6px;">
+                <button class="hud-btn" onclick="ingestYtDlpUrl()" style="flex:1; justify-content:center; background:rgba(239,68,68,0.18); border-color:#ef4444; color:#f87171;">
+                  🎬 Ingest URL
+                </button>
+                <button class="hud-btn" onclick="startBatchFetchTranscripts()" style="justify-content:center; background:rgba(234,179,8,0.15); border-color:#eab308; color:#facc15;" title="Fetch missing transcripts for existing YouTube items">
+                  ⚡ Sync Transcripts
+                </button>
+              </div>
+            </div>
+
             <button class="hud-btn" onclick="exportMarkdown()" style="justify-content:center;">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-              Export All Likes to Markdown
+              Export Items to Markdown
             </button>
 
             <button class="hud-btn" onclick="startMetricsEnrichment()" style="justify-content:center; background:rgba(244,63,94,0.12); border-color:#f43f5e; color:#f43f5e;">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/></svg>
-              ⚡ Enrich Live Like Counts & Metrics
+              ⚡ Enrich Live Counts & Metrics
             </button>
 
             <button class="hud-btn" onclick="startBulkUnlike()" style="background:rgba(239,68,68,0.15); border-color:#ef4444; color:#f87171; justify-content:center;">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/><path d="m12 5-1 4 2 3-2 4"/></svg>
               Clean & Unlike All on 𝕏
+            </button>
+
+            <button class="hud-btn" onclick="startBulkUnbookmark()" style="background:rgba(59,130,246,0.15); border-color:#3b82f6; color:#60a5fa; justify-content:center;">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
+              Clean & Un-bookmark All on 𝕏
+            </button>
+
+            <button class="hud-btn" onclick="startGhostLikesSweep()" style="background:rgba(168,85,247,0.15); border-color:#a855f7; color:#c084fc; justify-content:center;">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/><circle cx="9" cy="9" r="1"/><circle cx="15" cy="9" r="1"/></svg>
+              👻 Purge Ghost Likes on 𝕏
             </button>
           </div>
         </div>
@@ -1105,11 +1938,58 @@ async def index():
     </div>
   </div>
 
+  <!-- Global Command Palette Modal (Cmd/Ctrl + K) -->
+  <div id="hud-command-palette" class="cmd-palette-backdrop" onclick="if(event.target===this) toggleCommandPalette(false)">
+    <div class="cmd-palette-box">
+      <div class="cmd-palette-input-row">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input type="text" id="cmd-palette-input" class="cmd-palette-input" placeholder="Type a command or search (e.g. Zen, YouTube, RAG, Tag)..." oninput="filterCommandList(this.value)" onkeydown="onCommandInputKeydown(event)">
+        <span class="cmd-key-badge">ESC</span>
+      </div>
+      <div class="cmd-palette-list" id="cmd-palette-list"></div>
+    </div>
+  </div>
+
+  <!-- Pull to Refresh Floating Indicator -->
+  <div id="hud-pull-indicator">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+  </div>
+
+  <!-- Mobile Bottom Navigation Dock (<768px) -->
+  <nav class="hud-mobile-dock" aria-label="Mobile Navigation">
+    <button class="mob-nav-item active" id="mob-nav-all" onclick="setCollectionFilter('all')">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+      <span>All</span>
+    </button>
+    <button class="mob-nav-item" id="mob-nav-likes" onclick="setCollectionFilter('like')">
+      <svg viewBox="0 0 24 24"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/></svg>
+      <span>Likes</span>
+    </button>
+    <button class="mob-nav-item" id="mob-nav-bookmarks" onclick="setCollectionFilter('bookmark')">
+      <svg viewBox="0 0 24 24"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
+      <span>Saved</span>
+    </button>
+    <button class="mob-nav-item" id="mob-nav-youtube" onclick="setCollectionFilter('youtube')">
+      <svg viewBox="0 0 24 24"><path d="M22.54 6.42a2.78 2.78 0 0 0-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 0 0-1.94 2A29 29 0 0 0 1 11.75a29 29 0 0 0 .46 5.33A2.78 2.78 0 0 0 3.4 19c1.72.46 8.6.46 8.6.46s6.88 0 8.6-.46a2.78 2.78 0 0 0 1.94-2 29 29 0 0 0 .46-5.25 29 29 0 0 0-.46-5.33z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"/></svg>
+      <span>Videos</span>
+    </button>
+    <button class="mob-nav-item" id="mob-nav-chat" onclick="toggleChatDrawer()">
+      <svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      <span>RAG</span>
+    </button>
+    <button class="mob-nav-item" id="mob-nav-cmd" onclick="toggleCommandPalette(true)">
+      <svg viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+      <span>Cmd</span>
+    </button>
+  </nav>
+
   <script>
     let currentQuery = '';
     let currentTag = null;
     let currentAuthor = null;
+    let currentSource = 'all';
     let currentSort = localStorage.getItem('likes_sort') || 'newest_liked';
+    let currentEngine = localStorage.getItem('hud_search_engine') || 'auto';
     let isSemantic = false;
     let currentOffset = 0;
     let isLoading = false;
@@ -1127,6 +2007,42 @@ async def index():
     let isSelectMode = false;
     const selectedTweetIds = new Set();
     let confirmCallback = null;
+
+    function changeEngine(val) {{
+      currentEngine = val;
+      localStorage.setItem('hud_search_engine', val);
+      searchCache.clear();
+      loadLikes(false);
+    }}
+
+    /* Collection Filter Handler */
+    function setCollectionFilter(src) {{
+      currentSource = src;
+      document.querySelectorAll('.collection-tab').forEach(b => b.classList.remove('active'));
+      const tabId = 'tab-col-' + (src === 'like' ? 'likes' : (src === 'bookmark' ? 'bookmarks' : (src === 'youtube' ? 'youtube' : 'all')));
+      const activeBtn = document.getElementById(tabId);
+      if (activeBtn) activeBtn.classList.add('active');
+
+      document.querySelectorAll('.mob-nav-item').forEach(b => b.classList.remove('active'));
+      const mobNavId = 'mob-nav-' + (src === 'like' ? 'likes' : (src === 'bookmark' ? 'bookmarks' : (src === 'youtube' ? 'youtube' : 'all')));
+      const mobBtn = document.getElementById(mobNavId);
+      if (mobBtn) mobBtn.classList.add('active');
+
+      currentTag = null;
+      currentOffset = 0;
+      searchCache.clear();
+      refreshTags();
+      loadLikes(false);
+    }}
+
+    async function refreshTags() {{
+      try {{
+        const res = await fetch('/api/tags?source=' + currentSource);
+        const data = await res.json();
+        currentRawTags = data.tags || [];
+        renderTagCloud();
+      }} catch (e) {{}}
+    }}
 
     /* Top Tags & Expand/Collapse */
     let currentRawTags = {tags_json};
@@ -1172,7 +2088,7 @@ async def index():
       let escaped = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
       
       // Auto-hyperlink URLs
-      escaped = escaped.replace(/(https?:\\/\\/[^\\s]+)/g, '<a href="$1" target="_blank" onclick="event.stopPropagation()">$1</a>');
+      escaped = escaped.replace(/(https?:[/][/][^\\s]+)/g, '<a href="$1" target="_blank" onclick="event.stopPropagation()">$1</a>');
       
       // Auto-hyperlink @mentions
       escaped = escaped.replace(/@([a-zA-Z0-9_]+)/g, '<span class="tweet-mention" data-author="$1" onclick="event.stopPropagation(); filterAuthor(this.dataset.author)">@$1</span>');
@@ -1261,7 +2177,7 @@ async def index():
 
     async function loadLikes(append = false) {{
       if (isLoading) return;
-      const cacheKey = `${{currentQuery}}_${{currentTag}}_${{currentAuthor}}_${{currentSort}}_${{isSemantic}}_${{currentOffset}}`;
+      const cacheKey = `${{currentQuery}}_${{currentTag}}_${{currentAuthor}}_${{currentSource}}_${{currentSort}}_${{isSemantic}}_${{currentEngine}}_${{currentOffset}}`;
       if (searchCache.has(cacheKey)) {{
         const cachedData = searchCache.get(cacheKey);
         renderResults(cachedData, append);
@@ -1276,7 +2192,7 @@ async def index():
         hasMore = true;
       }}
 
-      let url = `/api/search?q=${{encodeURIComponent(currentQuery)}}&sort_by=${{currentSort}}&semantic=${{isSemantic}}&offset=${{currentOffset}}&limit=${{PAGE_LIMIT}}`;
+      let url = `/api/search?q=${{encodeURIComponent(currentQuery)}}&source=${{currentSource}}&sort_by=${{currentSort}}&semantic=${{isSemantic}}&engine=${{currentEngine}}&offset=${{currentOffset}}&limit=${{PAGE_LIMIT}}`;
       if (currentTag) url += `&tag=${{encodeURIComponent(currentTag)}}`;
       if (currentAuthor) url += `&author=${{encodeURIComponent(currentAuthor)}}`;
 
@@ -1293,7 +2209,7 @@ async def index():
     function resolveMediaUrl(p) {{
       if (!p) return '';
       if (p.startsWith('http://') || p.startsWith('https://') || p.startsWith('data:')) return p;
-      let clean = p.replace(/^data\//, '').replace(/^\/+/, '');
+      let clean = p.replace(/^data[/]/, '').replace(/^[/]+/, '');
       if (!clean.startsWith('media/')) clean = 'media/' + clean;
       return '/' + clean;
     }}
@@ -1315,19 +2231,34 @@ async def index():
         : `<img class="media-thumb" src="${{src}}" onerror="this.src='${{fallback}}'" onclick="event.stopPropagation(); openTweetModal('${{tweetId}}')" loading="lazy">`;
     }}
 
+    function getSourceBadgeHtml(src) {{
+      const s = (src || 'like').toLowerCase();
+      if (s === 'bookmark') return '<span class="source-badge bookmark" title="Bookmarked on X">🔖 Bookmark</span>';
+      if (s === 'both') return '<span class="source-badge both" title="Liked & Bookmarked on X">❤️ & 🔖</span>';
+      if (s === 'youtube') return '<span class="source-badge" style="background:rgba(239,68,68,0.18); color:#f87171; border:1px solid rgba(239,68,68,0.4);" title="YouTube Liked Video">▶️ YouTube</span>';
+      return '<span class="source-badge like" title="Liked on X">❤️ Liked</span>';
+    }}
+
     function renderResults(data, append) {{
       const container = document.getElementById('results');
       const results = data.results || [];
       const latencyIndicator = document.getElementById('latency-indicator');
-      if (data.latency_ms !== undefined) {{
-        latencyIndicator.innerText = data.semantic ? `🧠 ${{data.latency_ms}}ms (AI)` : `⚡ ${{data.latency_ms}}ms (FTS)`;
+      if (latencyIndicator) {{
+        if (data.lancedb_latency_ms !== null && data.lancedb_latency_ms !== undefined &&
+            data.meilisearch_latency_ms !== null && data.meilisearch_latency_ms !== undefined) {{
+          latencyIndicator.innerHTML = `⚡ LanceDB: <strong>${{data.lancedb_latency_ms}}ms</strong> | Meili: <strong>${{data.meilisearch_latency_ms}}ms</strong>`;
+        }} else if (data.meilisearch_latency_ms !== null && data.meilisearch_latency_ms !== undefined) {{
+          latencyIndicator.innerHTML = `🚀 Meili: <strong>${{data.meilisearch_latency_ms}}ms</strong>`;
+        }} else if (data.latency_ms !== undefined) {{
+          latencyIndicator.innerHTML = data.semantic ? `🧠 <strong>${{data.latency_ms}}ms</strong> (AI)` : `🔷 LanceDB: <strong>${{data.latency_ms}}ms</strong>`;
+        }}
       }}
 
       if (!append) container.innerHTML = '';
       if (results.length < PAGE_LIMIT) hasMore = false;
 
       if (results.length === 0 && !append) {{
-        container.innerHTML = '<div class="hud-tweet-card" style="text-align:center; color: var(--muted); grid-column: 1 / -1; padding:2rem;">No matching likes found.</div>';
+        container.innerHTML = '<div class="hud-tweet-card" style="text-align:center; color: var(--muted); grid-column: 1 / -1; padding:2rem;">No matching items found.</div>';
         return;
       }}
 
@@ -1341,6 +2272,7 @@ async def index():
         const cleanHandle = (r.author_handle || '').replace(/^@+/, '');
         const authorDisplay = cleanHandle ? '@' + cleanHandle : 'Post #' + r.tweet_id;
         const formattedText = formatTweetText(r.text);
+        const srcBadge = getSourceBadgeHtml(r.source);
 
         const isSelected = selectedTweetIds.has(r.tweet_id);
         const checkboxHtml = `<input type="checkbox" class="tweet-checkbox" onchange="onTweetCheckboxChange(event, '${{r.tweet_id}}')" onclick="event.stopPropagation()" ${{isSelected ? 'checked' : ''}}>`;
@@ -1352,6 +2284,7 @@ async def index():
               <span class="author-interactive" onclick="event.stopPropagation(); filterAuthor('${{cleanHandle}}')">${{authorDisplay}}</span>
               <span class="compact-text">${{r.text}}</span>
               <div style="display:flex; gap:0.35rem; align-items:center;">
+                ${{srcBadge}}
                 ${{(r.tags || []).slice(0, 2).map(t => `<span class="hud-tag" style="font-size:0.7rem; padding:0.1rem 0.4rem;" onclick="event.stopPropagation(); filterTag('${{t}}')">${{t}}</span>`).join('')}}
                 ${{r.favorite_count ? `<span class="like-badge" style="font-size:0.68rem; padding:1px 6px;">❤️ ${{formatCount(r.favorite_count)}}</span>` : ''}}
               </div>
@@ -1368,7 +2301,10 @@ async def index():
               <div class="gallery-body">
                 <div class="tweet-header">
                   <span class="author-interactive" onclick="event.stopPropagation(); filterAuthor('${{cleanHandle}}')"><strong>${{r.author_name || authorDisplay}}</strong></span>
-                  <a href="${{r.url}}" target="_blank" class="ext-link-icon" onclick="event.stopPropagation()" title="Open on X">↗</a>
+                  <div style="display:flex; align-items:center; gap:4px;">
+                    ${{srcBadge}}
+                    <a href="${{r.url}}" target="_blank" class="ext-link-icon" onclick="event.stopPropagation()" title="Open on X">↗</a>
+                  </div>
                 </div>
                 <p style="font-size:0.82rem; line-height:1.3; margin-bottom:0.5rem; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden;">${{r.text}}</p>
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-top:0.35rem;">
@@ -1388,9 +2324,12 @@ async def index():
                   <span class="author-interactive" onclick="event.stopPropagation(); filterAuthor('${{cleanHandle}}')"><strong>${{r.author_name || cleanHandle}}</strong></span>
                   <span class="handle-badge" onclick="event.stopPropagation(); filterAuthor('${{cleanHandle}}')">${{authorDisplay}}</span>
                 </div>
-                <a href="${{r.url}}" target="_blank" class="ext-link-icon" onclick="event.stopPropagation()" title="Open on X">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
-                </a>
+                <div style="display:flex; align-items:center; gap:6px;">
+                  ${{srcBadge}}
+                  <a href="${{r.url}}" target="_blank" class="ext-link-icon" onclick="event.stopPropagation()" title="Open on X">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+                  </a>
+                </div>
               </div>
               <div class="tweet-text">${{formattedText}}</div>
               ${{mediaList.length ? `<div class="media-grid">${{mediaList.map(m => renderMediaElement(m, fallbackSrc, r.tweet_id, false)).join('')}}</div>` : ''}}
@@ -1588,8 +2527,31 @@ async def index():
       }});
     }}
 
+    /* Centralized Mutual Panel Exclusion Coordinator */
+    function closeConflictingPanels(except) {{
+      if (except !== 'chat') {{
+        const chat = document.getElementById('hud-chat-drawer');
+        if (chat && chat.classList.contains('open')) chat.classList.remove('open');
+        const btnChat = document.getElementById('btn-chat-icon');
+        if (btnChat) btnChat.classList.remove('active');
+      }}
+      if (except !== 'sidesheet') {{
+        const sheet = document.getElementById('hud-sidesheet');
+        if (sheet && sheet.classList.contains('open')) sheet.classList.remove('open');
+      }}
+      if (except !== 'command-palette') {{
+        const pal = document.getElementById('hud-command-palette');
+        if (pal && pal.classList.contains('open')) pal.classList.remove('open');
+      }}
+      if (except !== 'tweet-modal') {{
+        const modal = document.getElementById('hud-tweet-modal');
+        if (modal && modal.classList.contains('open')) closeTweetModal();
+      }}
+    }}
+
     /* Lightbox Modal Logic */
     function openTweetModal(tweetId) {{
+      closeConflictingPanels('tweet-modal');
       const tweet = loadedTweetsMap.get(tweetId);
       if (!tweet) return;
       activeModalTweet = tweet;
@@ -1599,6 +2561,11 @@ async def index():
       document.getElementById('modal-author-handle').innerText = cleanHandle ? '@' + cleanHandle : '';
       document.getElementById('modal-tweet-text').innerHTML = formatTweetText(tweet.text);
       document.getElementById('modal-open-x-btn').href = tweet.url || `https://x.com/${{cleanHandle}}/status/${{tweet.tweet_id}}`;
+
+      const srcBadgeEl = document.getElementById('modal-source-badge');
+      if (srcBadgeEl) {{
+        srcBadgeEl.outerHTML = `<span id="modal-source-badge">${{getSourceBadgeHtml(tweet.source)}}</span>`;
+      }}
 
       const likesBadge = document.getElementById('modal-likes-count');
       if (likesBadge) {{
@@ -1610,6 +2577,12 @@ async def index():
         }}
       }}
 
+      const unlikeBtn = document.getElementById('modal-unlike-btn');
+      const unbookmarkBtn = document.getElementById('modal-unbookmark-btn');
+      const srcType = (tweet.source || 'like').toLowerCase();
+      if (unlikeBtn) unlikeBtn.style.display = (srcType === 'like' || srcType === 'both') ? 'inline-flex' : 'none';
+      if (unbookmarkBtn) unbookmarkBtn.style.display = (srcType === 'bookmark' || srcType === 'both') ? 'inline-flex' : 'none';
+
       const filterAuthorBtn = document.getElementById('modal-filter-author-btn');
       if (cleanHandle) {{
         filterAuthorBtn.style.display = 'inline-flex';
@@ -1619,15 +2592,70 @@ async def index():
       }}
 
       const mediaContainer = document.getElementById('modal-media-container');
-      const mediaList = (tweet.local_media_paths && tweet.local_media_paths.length)
-        ? tweet.local_media_paths.map(resolveMediaUrl)
-        : (tweet.media_urls || []).map(resolveMediaUrl);
-      const fallbackSrc = (tweet.media_urls && tweet.media_urls.length) ? tweet.media_urls[0] : '';
-      
-      if (mediaList.length > 0) {{
-        mediaContainer.innerHTML = mediaList.map(m => renderMediaElement(m, fallbackSrc, tweet.tweet_id, true)).join('');
+      const transcriptSec = document.getElementById('modal-transcript-section');
+      const transcriptList = document.getElementById('modal-transcript-container');
+      const transcriptIndicator = document.getElementById('modal-transcript-indicator');
+
+      if (tweet.source === 'youtube') {{
+        const vidId = tweet.tweet_id.replace(/^yt_/, '');
+        mediaContainer.innerHTML = `
+          <div style="position:relative; padding-bottom:56.25%; height:0; overflow:hidden; border-radius:12px; margin-bottom:1rem; border:1px solid rgba(255,255,255,0.15); box-shadow:0 8px 30px rgba(0,0,0,0.7);">
+            <iframe id="youtube-modal-iframe" src="https://www.youtube-nocookie.com/embed/${{vidId}}?autoplay=1&rel=0" style="position:absolute; top:0; left:0; width:100%; height:100%; border:0;" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
+          </div>
+        `;
+        if (openBtn) {{
+          openBtn.innerHTML = `
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/></svg> Open on YouTube
+          `;
+        }}
+        if (transcriptSec) {{
+          transcriptSec.style.display = 'block';
+          transcriptIndicator.innerText = 'Loading transcript...';
+          transcriptList.innerHTML = '<div class="skeleton" style="height:45px; border-radius:6px;"></div>';
+          fetch(`/api/youtube/transcript/${{vidId}}`)
+            .then(res => res.json())
+            .then(data => {{
+              const segs = data.segments || [];
+              if (segs.length === 0) {{
+                transcriptIndicator.innerText = 'No captions available';
+                transcriptList.innerHTML = '<span style="color:var(--muted); font-size:0.78rem;">No subtitles or transcription available for this video.</span>';
+                return;
+              }}
+              transcriptIndicator.innerText = `${{segs.length}} moments synced`;
+              transcriptList.innerHTML = segs.map(s => {{
+                const mins = Math.floor(s.start / 60);
+                const secs = Math.floor(s.start % 60).toString().padStart(2, '0');
+                const timeLabel = `${{mins}}:${{secs}}`;
+                return `
+                  <div style="display:flex; gap:8px; align-items:baseline; margin-bottom:6px; cursor:pointer;" onclick="seekYouTubePlayer(${{s.start}})" title="Jump to ${{timeLabel}}">
+                    <span style="background:rgba(56,189,248,0.15); color:#38bdf8; border:1px solid rgba(56,189,248,0.3); padding:1px 6px; border-radius:4px; font-family:'JetBrains Mono',monospace; font-size:0.72rem; flex-shrink:0;">${{timeLabel}}</span>
+                    <span style="color:#cbd5e1;">${{s.text}}</span>
+                  </div>
+                `;
+              }}).join('');
+            }})
+            .catch(() => {{
+              transcriptIndicator.innerText = 'Transcript error';
+              transcriptList.innerHTML = '<span style="color:var(--muted); font-size:0.78rem;">Could not load transcript.</span>';
+            }});
+        }}
       }} else {{
-        mediaContainer.innerHTML = '';
+        if (transcriptSec) transcriptSec.style.display = 'none';
+        const mediaList = (tweet.local_media_paths && tweet.local_media_paths.length)
+          ? tweet.local_media_paths.map(resolveMediaUrl)
+          : (tweet.media_urls || []).map(resolveMediaUrl);
+        const fallbackSrc = (tweet.media_urls && tweet.media_urls.length) ? tweet.media_urls[0] : '';
+        
+        if (mediaList.length > 0) {{
+          mediaContainer.innerHTML = mediaList.map(m => renderMediaElement(m, fallbackSrc, tweet.tweet_id, true)).join('');
+        }} else {{
+          mediaContainer.innerHTML = '';
+        }}
+        if (openBtn) {{
+          openBtn.innerHTML = `
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg> Open on X
+          `;
+        }}
       }}
 
       const tagsContainer = document.getElementById('modal-tags-container');
@@ -1666,6 +2694,7 @@ async def index():
                   <div class="similar-card-text">${{s.text}}</div>
                   <div style="display:flex; justify-content:space-between; align-items:center; margin-top:2px;">
                     <div style="display:flex; gap:4px;">
+                      ${{getSourceBadgeHtml(s.source)}}
                       ${{(s.tags || []).slice(0, 2).map(t => `<span class="hud-tag" style="font-size:0.65rem; padding:1px 5px;" onclick="event.stopPropagation(); filterTag('${{t}}')">${{t}}</span>`).join('')}}
                     </div>
                     ${{s.favorite_count ? `<span class="like-badge" style="font-size:0.65rem; padding:1px 5px;">❤️ ${{formatCount(s.favorite_count)}}</span>` : ''}}
@@ -1685,6 +2714,8 @@ async def index():
 
     function closeTweetModal() {{
       document.getElementById('hud-tweet-modal').classList.remove('open');
+      const mediaContainer = document.getElementById('modal-media-container');
+      if (mediaContainer) mediaContainer.innerHTML = '';
       activeModalTweet = null;
     }}
 
@@ -1713,18 +2744,215 @@ async def index():
       if (data.unliked) {{
         alert('Tweet unliked successfully on X!');
         closeTweetModal();
+        searchCache.clear();
+        refreshStats();
+        loadLikes(false);
       }} else {{
         alert('Failed to unlike on X.');
       }}
     }}
 
-    document.addEventListener('keydown', (e) => {{
-      if (e.key === 'Escape') {{
+    async function unbookmarkActiveModalTweet() {{
+      if (!activeModalTweet) return;
+      if (!confirm('Remove this tweet from bookmarks on X?')) return;
+      const res = await fetch('/api/maintenance/unbookmark-single', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ tweet_id: activeModalTweet.tweet_id }})
+      }});
+      const data = await res.json();
+      if (data.unbookmarked) {{
+        alert('Bookmark removed successfully on X!');
         closeTweetModal();
+        searchCache.clear();
+        refreshStats();
+        loadLikes(false);
+      }} else {{
+        alert('Failed to remove bookmark on X.');
+      }}
+    }}
+
+    /* Command Palette Data & Handler */
+    const COMMAND_ITEMS = [
+      {{ id: 'search', label: '🔍 Instant Search', desc: 'Focus instant search bar', key: '/', action: () => {{ toggleCommandPalette(false); const q = document.getElementById('query'); if (q) {{ q.focus(); q.select(); }} }} }},
+      {{ id: 'semantic', label: '🧠 Deep AI Semantic Search', desc: 'Toggle vector embedding search mode', key: 'S', action: () => {{ toggleCommandPalette(false); toggleSemanticMode(); }} }},
+      {{ id: 'filter_all', label: '🌐 Show All Items', desc: 'View Twitter + YouTube combined feed', key: '1', action: () => {{ toggleCommandPalette(false); setCollectionFilter('all'); }} }},
+      {{ id: 'filter_likes', label: '❤️ Filter 𝕏 Likes', desc: 'View Twitter liked posts only', key: '2', action: () => {{ toggleCommandPalette(false); setCollectionFilter('like'); }} }},
+      {{ id: 'filter_bookmarks', label: '🔖 Filter 𝕏 Bookmarks', desc: 'View Twitter bookmarks only', key: '3', action: () => {{ toggleCommandPalette(false); setCollectionFilter('bookmark'); }} }},
+      {{ id: 'filter_youtube', label: '▶️ Filter YouTube Likes', desc: 'View YouTube liked videos with transcripts', key: '4', action: () => {{ toggleCommandPalette(false); setCollectionFilter('youtube'); }} }},
+      {{ id: 'zen', label: '🧘 Toggle Zen Mode', desc: 'Distraction-free fullscreen reading layout', key: 'Z', action: () => {{ toggleCommandPalette(false); toggleZenMode(); }} }},
+      {{ id: 'chat', label: '💬 Open LanceDB RAG Chat', desc: 'Ask AI assistant across all saved knowledge', key: 'C', action: () => {{ toggleCommandPalette(false); toggleChatDrawer(); }} }},
+      {{ id: 'reconcile', label: '🔄 Reconcile Search Stores', desc: 'Synchronize document parity between LanceDB & Meilisearch', key: 'R', action: () => {{ toggleCommandPalette(false); reconcileStores(); }} }},
+      {{ id: 'sync_transcripts', label: '⚡ Sync Video Transcripts', desc: 'Fetch missing subtitles for all YouTube items', key: 'T', action: () => {{ toggleCommandPalette(false); startBatchFetchTranscripts(); }} }},
+      {{ id: 'export', label: '📥 Export to Markdown', desc: 'Export items & transcripts to Obsidian/Logseq folder', key: 'E', action: () => {{ toggleCommandPalette(false); exportMarkdown(); }} }},
+      {{ id: 'ingest_url', label: '📥 Ingest Tweet or YouTube URL', desc: 'Directly archive any tweet or YouTube link', key: 'I', action: () => {{ toggleCommandPalette(false); ingestPromptUrl(); }} }},
+      {{ id: 'authors', label: '👑 View Top Authors Leaderboard', desc: 'See which creators and accounts you like most', key: 'A', action: () => {{ toggleCommandPalette(false); toggleSidesheet('authors'); }} }},
+      {{ id: 'settings', label: '⚙️ Open HUD Settings', desc: 'Configure sync, auth, and layout options', key: ',', action: () => {{ toggleCommandPalette(false); openSettingsTab(); }} }},
+    ];
+
+    async function ingestPromptUrl() {{
+      const url = prompt('Enter 𝕏 Tweet URL or YouTube Video URL to ingest:');
+      if (!url || !url.trim()) return;
+      try {{
+        const res = await fetch('/api/ingest/url', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ url: url.trim() }})
+        }});
+        const data = await res.json();
+        if (res.ok) {{
+          alert('Successfully ingested: ' + (data.item?.text?.slice(0, 60) || data.type));
+          searchCache.clear();
+          refreshStats();
+          loadLikes(false);
+        }} else {{
+          alert('Ingest error: ' + (data.message || 'Failed to ingest URL'));
+        }}
+      }} catch (err) {{
+        alert('Failed to connect to ingest server: ' + err);
+      }}
+    }}
+
+    let selectedCmdIndex = 0;
+    let filteredCmds = [...COMMAND_ITEMS];
+
+    function toggleCommandPalette(forceState) {{
+      const palette = document.getElementById('hud-command-palette');
+      if (!palette) return;
+      const isOpen = forceState !== undefined ? forceState : !palette.classList.contains('open');
+      if (isOpen) {{
+        closeConflictingPanels('command-palette');
+        palette.classList.add('open');
+        const input = document.getElementById('cmd-palette-input');
+        if (input) {{
+          input.value = '';
+          input.focus();
+        }}
+        filteredCmds = [...COMMAND_ITEMS];
+        selectedCmdIndex = 0;
+        renderCommandList();
+      }} else {{
+        palette.classList.remove('open');
+      }}
+    }}
+
+    function renderCommandList() {{
+      const container = document.getElementById('cmd-palette-list');
+      if (!container) return;
+      if (filteredCmds.length === 0) {{
+        container.innerHTML = '<div style="color:var(--muted); padding:1rem; text-align:center; font-size:0.85rem;">No matching commands.</div>';
+        return;
+      }}
+      container.innerHTML = filteredCmds.map((cmd, idx) => `
+        <div class="cmd-item ${{idx === selectedCmdIndex ? 'selected' : ''}}" onclick="executeCommand(${{idx}})">
+          <div>
+            <div style="font-weight:600; color:#f1f5f9;">${{cmd.label}}</div>
+            <div style="font-size:0.75rem; color:var(--muted);">${{cmd.desc}}</div>
+          </div>
+          <span class="cmd-key-badge">${{cmd.key}}</span>
+        </div>
+      `).join('');
+    }}
+
+    function filterCommandList(q) {{
+      const query = (q || '').toLowerCase().trim();
+      if (!query) {{
+        filteredCmds = [...COMMAND_ITEMS];
+      }} else {{
+        filteredCmds = COMMAND_ITEMS.filter(c => 
+          c.label.toLowerCase().includes(query) || 
+          c.desc.toLowerCase().includes(query) || 
+          c.key.toLowerCase().includes(query)
+        );
+      }}
+      selectedCmdIndex = 0;
+      renderCommandList();
+    }}
+
+    function onCommandInputKeydown(e) {{
+      if (e.key === 'ArrowDown') {{
+        e.preventDefault();
+        selectedCmdIndex = (selectedCmdIndex + 1) % filteredCmds.length;
+        renderCommandList();
+      }} else if (e.key === 'ArrowUp') {{
+        e.preventDefault();
+        selectedCmdIndex = (selectedCmdIndex - 1 + filteredCmds.length) % filteredCmds.length;
+        renderCommandList();
+      }} else if (e.key === 'Enter') {{
+        e.preventDefault();
+        if (filteredCmds[selectedCmdIndex]) {{
+          executeCommand(selectedCmdIndex);
+        }}
+      }} else if (e.key === 'Escape') {{
+        toggleCommandPalette(false);
+      }}
+    }}
+
+    function executeCommand(index) {{
+      const cmd = filteredCmds[index];
+      if (cmd && typeof cmd.action === 'function') {{
+        cmd.action();
+      }}
+    }}
+
+    async function reconcileStores() {{
+      showToast('🔄 Reconciling LanceDB & Meilisearch stores...', 'info');
+      try {{
+        const res = await fetch('/api/maintenance/reconcile-stores', {{ method: 'POST' }});
+        const data = await res.json();
+        if (res.ok) {{
+          showToast(`✅ Parity Reconciled! ${{data.meilisearch_count}} documents indexed.`, 'success');
+          refreshStats();
+        }} else {{
+          showToast('❌ Failed to reconcile search stores.', 'error');
+        }}
+      }} catch (e) {{
+        showToast('❌ Network error during store reconciliation.', 'error');
+      }}
+    }}
+
+    document.addEventListener('keydown', (e) => {{
+      const activeTag = document.activeElement ? document.activeElement.tagName.toLowerCase() : '';
+      const isInput = activeTag === 'input' || activeTag === 'textarea' || document.activeElement?.isContentEditable;
+
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {{
+        e.preventDefault();
+        toggleCommandPalette();
+        return;
+      }}
+
+      if (e.key === 'Escape') {{
+        const palette = document.getElementById('hud-command-palette');
+        if (palette && palette.classList.contains('open')) {{
+          toggleCommandPalette(false);
+          return;
+        }}
+        const modal = document.getElementById('hud-tweet-modal');
+        const isModalOpen = modal && modal.style.display === 'flex';
         const drawer = document.getElementById('hud-chat-drawer');
-        if (drawer.classList.contains('open')) drawer.classList.remove('open');
+        const isDrawerOpen = drawer && drawer.classList.contains('open');
         const sheet = document.getElementById('hud-sidesheet');
-        if (sheet.classList.contains('open')) sheet.classList.remove('open');
+        const isSheetOpen = sheet && sheet.classList.contains('open');
+
+        if (isModalOpen) {{
+          closeTweetModal();
+          return;
+        }}
+        if (drawer && isDrawerOpen) {{
+          drawer.classList.remove('open');
+          return;
+        }}
+        if (sheet && isSheetOpen) {{
+          sheet.classList.remove('open');
+          return;
+        }}
+        if (document.body.classList.contains('workspace-fullscreen--zen')) {{
+          toggleZenMode(false);
+          return;
+        }}
+      }} else if (!isInput && (e.key === 'z' || e.key === 'Z') && !e.ctrlKey && !e.metaKey && !e.altKey) {{
+        e.preventDefault();
+        toggleZenMode();
       }}
     }});
 
@@ -1754,8 +2982,17 @@ async def index():
       isSyncEnabled = data.enabled;
       nextSyncSeconds = data.status.next_sync_in_sec || syncInterval;
       const btn = document.getElementById('btn-auto-sync-icon');
-      if (isSyncEnabled) btn.classList.add('active');
-      else btn.classList.remove('active');
+      if (btn) {{
+        if (isSyncEnabled) btn.classList.add('active');
+        else btn.classList.remove('active');
+      }}
+      const statusEl = document.getElementById('setting-auto-sync-status');
+      if (statusEl) statusEl.innerText = isSyncEnabled ? 'ON' : 'OFF';
+      const settingBtn = document.getElementById('setting-auto-sync-btn');
+      if (settingBtn) {{
+        if (isSyncEnabled) settingBtn.classList.add('active');
+        else settingBtn.classList.remove('active');
+      }}
     }}
 
     async function changeSyncInterval(val) {{
@@ -1768,6 +3005,8 @@ async def index():
       }});
       const data = await res.json();
       nextSyncSeconds = data.scheduler.next_sync_in_sec || sec;
+      const sel = document.getElementById('setting-interval');
+      if (sel) sel.value = val;
     }}
 
     let newLikesCountDuringSession = 0;
@@ -1783,13 +3022,36 @@ async def index():
       if (!data) return;
       const st = data.stats;
       if (st) {{
+        const totalItems = st.total_items !== undefined ? st.total_items : (st.total_likes || 0);
+        const totalLikes = st.total_likes !== undefined ? st.total_likes : 0;
+        const totalBookmarks = st.total_bookmarks !== undefined ? st.total_bookmarks : 0;
+
         const statTotal = document.getElementById('stat-total');
+        const statLikes = document.getElementById('stat-likes');
+        const statBookmarks = document.getElementById('stat-bookmarks');
         const statMedia = document.getElementById('stat-media');
         const statTags = document.getElementById('stat-tags');
-        if (statTotal && st.total_likes !== undefined && statTotal.innerText !== String(st.total_likes)) {{
-          statTotal.innerText = st.total_likes;
+
+        const badgeAll = document.getElementById('badge-count-all');
+        const badgeLikes = document.getElementById('badge-count-likes');
+        const badgeBookmarks = document.getElementById('badge-count-bookmarks');
+
+        if (statTotal && statTotal.innerText !== String(totalItems)) {{
+          statTotal.innerText = totalItems;
           animateTickerPulse(statTotal);
         }}
+        if (statLikes && statLikes.innerText !== String(totalLikes)) {{
+          statLikes.innerText = totalLikes;
+          animateTickerPulse(statLikes);
+        }}
+        if (statBookmarks && statBookmarks.innerText !== String(totalBookmarks)) {{
+          statBookmarks.innerText = totalBookmarks;
+          animateTickerPulse(statBookmarks);
+        }}
+        if (badgeAll) badgeAll.innerText = totalItems;
+        if (badgeLikes) badgeLikes.innerText = totalLikes;
+        if (badgeBookmarks) badgeBookmarks.innerText = totalBookmarks;
+
         if (statMedia && st.archived_media_files !== undefined && statMedia.innerText !== String(st.archived_media_files)) {{
           statMedia.innerText = st.archived_media_files;
           animateTickerPulse(statMedia);
@@ -1826,11 +3088,11 @@ async def index():
       }}
     }}
 
-    function showNewLikesPill(count) {{
+    function showNewItemsPill(count, type = 'item') {{
       const pill = document.getElementById('hud-new-likes-pill');
       const text = document.getElementById('hud-new-likes-text');
       if (pill && text) {{
-        text.innerText = `+${{count}} new like${{count > 1 ? 's' : ''}} synced`;
+        text.innerText = `+${{count}} new ${{type}}${{count > 1 ? 's' : ''}} synced`;
         pill.style.display = 'flex';
       }}
     }}
@@ -1866,14 +3128,25 @@ async def index():
         }});
         sseSource.addEventListener('new_like', (e) => {{
           try {{
-            const item = JSON.parse(e.data);
             newLikesCountDuringSession++;
-            showNewLikesPill(newLikesCountDuringSession);
-            const statTotal = document.getElementById('stat-total');
-            if (statTotal) {{
-              const cur = parseInt(statTotal.innerText.replace(/,/g, '')) || 0;
-              statTotal.innerText = cur + 1;
-              animateTickerPulse(statTotal);
+            showNewItemsPill(newLikesCountDuringSession, 'like');
+            const statLikes = document.getElementById('stat-likes');
+            if (statLikes) {{
+              const cur = parseInt(statLikes.innerText.replace(/,/g, '')) || 0;
+              statLikes.innerText = cur + 1;
+              animateTickerPulse(statLikes);
+            }}
+          }} catch (err) {{}}
+        }});
+        sseSource.addEventListener('new_bookmark', (e) => {{
+          try {{
+            newLikesCountDuringSession++;
+            showNewItemsPill(newLikesCountDuringSession, 'bookmark');
+            const statBookmarks = document.getElementById('stat-bookmarks');
+            if (statBookmarks) {{
+              const cur = parseInt(statBookmarks.innerText.replace(/,/g, '')) || 0;
+              statBookmarks.innerText = cur + 1;
+              animateTickerPulse(statBookmarks);
             }}
           }} catch (err) {{}}
         }});
@@ -1896,9 +3169,9 @@ async def index():
         const schedData = await schedRes.json();
         handleTelemetryUpdate({{ scheduler: schedData }});
 
-        const tagsRes = await fetch('/api/tags');
+        const tagsRes = await fetch('/api/tags?source=' + currentSource);
         const tagsData = await tagsRes.json();
-        if (tagsData.tags && tagsData.tags.length !== currentRawTags.length) {{
+        if (tagsData.tags) {{
           currentRawTags = tagsData.tags || [];
           renderTagCloud();
         }}
@@ -1912,9 +3185,17 @@ async def index():
     /* RAG Chat Drawer Logic */
     function toggleChatDrawer() {{
       const drawer = document.getElementById('hud-chat-drawer');
-      drawer.classList.toggle('open');
-      if (drawer.classList.contains('open')) {{
+      const willOpen = !drawer.classList.contains('open');
+      if (willOpen) {{
+        closeConflictingPanels('chat');
+        drawer.classList.add('open');
+        const btnChat = document.getElementById('btn-chat-icon');
+        if (btnChat) btnChat.classList.add('active');
         document.getElementById('chat-input').focus();
+      }} else {{
+        drawer.classList.remove('open');
+        const btnChat = document.getElementById('btn-chat-icon');
+        if (btnChat) btnChat.classList.remove('active');
       }}
     }}
 
@@ -1954,7 +3235,7 @@ async def index():
         if (data.type === 'sources') {{
           const sources = data.sources || [];
           if (sources.length > 0) {{
-            sourcesEl.innerHTML = '<strong style="color:var(--muted); font-size:0.75rem;">Cited Likes:</strong>' + sources.map(s => `
+            sourcesEl.innerHTML = '<strong style="color:var(--muted); font-size:0.75rem;">Cited Sources:</strong>' + sources.map(s => `
               <div class="chat-source-card" onclick="openTweetModal('${{s.tweet_id}}')">
                 <strong>[${{s.index}}] @${{(s.author_handle || '').replace(/^@+/, '')}}</strong>: ${{s.text.slice(0, 70)}}...
                 <span style="color:var(--primary); margin-left:4px;">[View Detail]</span>
@@ -1973,7 +3254,7 @@ async def index():
       }};
     }}
 
-    function startSyncStream() {{
+    function startSyncStream(targetCollection = 'all') {{
       const toast = document.getElementById('floating-sync-toast');
       const toastTitle = document.getElementById('toast-title');
       const toastDetail = document.getElementById('toast-status-detail');
@@ -1982,50 +3263,85 @@ async def index():
       const toastLog = document.getElementById('toast-log');
       
       toast.style.display = 'block';
-      toastLog.innerHTML = '<div>[Connected] Initializing sync...</div>';
+      toastLog.innerHTML = `<div>[Connected] Initializing ${{targetCollection}} sync...</div>`;
       toastFill.style.width = '10%';
       toastPercent.innerText = '10%';
 
-      const es = new EventSource('/api/sync/stream?max_tweets=0');
-      es.onmessage = function(e) {{
-        const data = JSON.parse(e.data);
-        if (data.error) {{
-          toastTitle.innerText = 'Sync Error';
-          toastDetail.innerText = data.error;
-          toastLog.innerHTML += `<div style="color:#ef4444;">[ERROR] ${{data.error}}</div>`;
+      function runSyncEndpoint(endpointUrl, onComplete) {{
+        const es = new EventSource(endpointUrl);
+        es.onmessage = function(e) {{
+          const data = JSON.parse(e.data);
+          if (data.error) {{
+            toastTitle.innerText = 'Sync Error';
+            toastDetail.innerText = data.error;
+            toastLog.innerHTML += `<div style="color:#ef4444;">[ERROR] ${{data.error}}</div>`;
+            es.close();
+            if (onComplete) onComplete();
+            return;
+          }}
+          if (data.stage === 'scrolling') {{
+            toastTitle.innerText = `Found ${{data.tweets_found}} items...`;
+            toastDetail.innerText = `Scroll attempt #${{data.scroll_attempt}}`;
+            toastLog.innerHTML += `<div>Scraped ${{data.tweets_found}} items...</div>`;
+            toastLog.scrollTop = toastLog.scrollHeight;
+          }} else if (data.stage === 'item_done') {{
+            const cleanHandle = (data.author_handle || 'user').replace(/^@+/, '');
+            toastTitle.innerText = `Ingesting (#${{data.current}})...`;
+            toastDetail.innerText = `@${{cleanHandle}}: "${{data.text.slice(0, 30)}}..."`;
+            toastFill.style.width = `${{Math.min(90, 20 + data.current * 3)}}%`;
+            toastPercent.innerText = `${{Math.min(90, 20 + data.current * 3)}}%`;
+            toastLog.innerHTML += `<div>[Saved] @${{cleanHandle}}</div>`;
+            toastLog.scrollTop = toastLog.scrollHeight;
+          }} else if (data.stage === 'complete') {{
+            toastLog.innerHTML += `<div style="color:#10b981; font-weight:bold;">[DONE] ${{data.message}}</div>`;
+            es.close();
+            if (onComplete) onComplete();
+          }}
+        }};
+        es.onerror = function() {{
+          toastTitle.innerText = 'Sync Ended';
           es.close();
-          return;
-        }}
-        if (data.stage === 'scrolling') {{
-          toastTitle.innerText = `Found ${{data.tweets_found}} likes...`;
-          toastDetail.innerText = `Scroll attempt #${{data.scroll_attempt}}`;
-          toastLog.innerHTML += `<div>Scraped ${{data.tweets_found}} likes...</div>`;
-          toastLog.scrollTop = toastLog.scrollHeight;
-        }} else if (data.stage === 'item_done') {{
-          const cleanHandle = (data.author_handle || 'user').replace(/^@+/, '');
-          toastTitle.innerText = `Ingesting (#${{data.current}})...`;
-          toastDetail.innerText = `@${{cleanHandle}}: "${{data.text.slice(0, 30)}}..."`;
-          toastFill.style.width = `${{Math.min(90, 20 + data.current * 3)}}%`;
-          toastPercent.innerText = `${{Math.min(90, 20 + data.current * 3)}}%`;
-          toastLog.innerHTML += `<div>[Saved] @${{cleanHandle}} ${{data.unliked ? '(Unliked on X)' : ''}}</div>`;
-          toastLog.scrollTop = toastLog.scrollHeight;
-        }} else if (data.stage === 'complete') {{
+          if (onComplete) onComplete();
+        }};
+      }}
+
+      if (targetCollection === 'bookmarks') {{
+        runSyncEndpoint('/api/bookmarks/sync/stream?max_tweets=0', () => {{
           toastFill.style.width = '100%';
           toastPercent.innerText = '100%';
-          toastTitle.innerText = 'Sync Complete!';
-          toastDetail.innerText = data.message;
-          toastLog.innerHTML += `<div style="color:#10b981; font-weight:bold;">[DONE] ${{data.message}}</div>`;
-          es.close();
+          toastTitle.innerText = 'Bookmarks Sync Complete!';
           searchCache.clear();
           refreshStats();
-          if (!currentQuery && !currentTag) loadLikes(false);
+          loadLikes(false);
           setTimeout(() => {{ toast.style.display = 'none'; }}, 4000);
-        }}
-      }};
-      es.onerror = function() {{
-        toastTitle.innerText = 'Sync Ended';
-        es.close();
-      }};
+        }});
+      }} else if (targetCollection === 'likes') {{
+        runSyncEndpoint('/api/sync/stream?collection=likes&max_tweets=0', () => {{
+          toastFill.style.width = '100%';
+          toastPercent.innerText = '100%';
+          toastTitle.innerText = 'Likes Sync Complete!';
+          searchCache.clear();
+          refreshStats();
+          loadLikes(false);
+          setTimeout(() => {{ toast.style.display = 'none'; }}, 4000);
+        }});
+      }} else {{
+        // Full Sync: Likes then Bookmarks sequentially
+        toastTitle.innerText = 'Syncing Likes...';
+        runSyncEndpoint('/api/sync/stream?collection=likes&max_tweets=0', () => {{
+          toastTitle.innerText = 'Syncing Bookmarks...';
+          runSyncEndpoint('/api/bookmarks/sync/stream?max_tweets=0', () => {{
+            toastFill.style.width = '100%';
+            toastPercent.innerText = '100%';
+            toastTitle.innerText = 'Full Sync Complete!';
+            toastDetail.innerText = 'Likes and bookmarks are up to date.';
+            searchCache.clear();
+            refreshStats();
+            loadLikes(false);
+            setTimeout(() => {{ toast.style.display = 'none'; }}, 4000);
+          }});
+        }});
+      }}
     }}
 
     function startMetricsEnrichment() {{
@@ -2088,28 +3404,83 @@ async def index():
 
     function toggleSidesheet(preferredTab = null) {{
       const sheet = document.getElementById('hud-sidesheet');
-      sheet.classList.toggle('open');
-      if (sheet.classList.contains('open')) {{
+      const willOpen = !sheet.classList.contains('open');
+      if (willOpen) {{
+        closeConflictingPanels('sidesheet');
+        sheet.classList.add('open');
         const activeTab = preferredTab || document.querySelector('.hud-tab.active')?.id.replace('tab-btn-', '') || 'logs';
         switchHistTab(activeTab);
+      }} else {{
+        sheet.classList.remove('open');
       }}
     }}
 
     function openSettingsTab() {{
+      closeConflictingPanels('sidesheet');
       const sheet = document.getElementById('hud-sidesheet');
       if (!sheet.classList.contains('open')) sheet.classList.add('open');
       switchHistTab('settings');
     }}
 
     function switchHistTab(t) {{
-      ['logs', 'notifs', 'settings'].forEach(tab => {{
+      ['logs', 'authors', 'notifs', 'settings'].forEach(tab => {{
         const el = document.getElementById('tab-' + tab);
         const btn = document.getElementById('tab-btn-' + tab);
         if (el) el.style.display = tab === t ? 'block' : 'none';
         if (btn) btn.className = 'hud-tab ' + (tab === t ? 'active' : '');
       }});
       if (t === 'logs' && !cachedLogs) loadHistoryLogs();
+      if (t === 'authors') loadTopAuthors();
       if (t === 'notifs' && !cachedNotifs) loadNotifications();
+    }}
+
+    async function loadTopAuthors() {{
+      const container = document.getElementById('authors-container');
+      if (!container) return;
+      container.innerHTML = renderSidesheetSkeleton();
+      const src = document.getElementById('author-source-select')?.value || 'all';
+      const sort = document.getElementById('author-sort-select')?.value || 'count';
+      try {{
+        const res = await fetch(`/api/authors/leaderboard?source=${{src}}&sort_by=${{sort}}&limit=50`);
+        const data = await res.json();
+        const authors = data.authors || [];
+        if (authors.length === 0) {{
+          container.innerHTML = '<p style="color:var(--muted); text-align:center; padding:1.5rem;">No creator records found for this filter.</p>';
+          return;
+        }}
+        container.innerHTML = authors.map(a => {{
+          const rankClass = a.rank === 1 ? 'rank-1' : (a.rank === 2 ? 'rank-2' : (a.rank === 3 ? 'rank-3' : ''));
+          const cleanH = (a.author_handle || '').replace(/^@+/, '');
+          return `
+            <div class="author-rank-card" onclick="filterAuthor('${{cleanH}}')">
+              <div style="display:flex; justify-content:space-between; align-items:center;">
+                <div style="display:flex; align-items:center; gap:8px;">
+                  <span class="rank-badge ${{rankClass}}">#${{a.rank}}</span>
+                  <div>
+                    <div style="font-weight:700; color:#fff; font-size:0.88rem;">${{a.author_name}}</div>
+                    <div style="color:var(--muted); font-size:0.75rem; font-family:'JetBrains Mono',monospace;">${{a.author_handle}}</div>
+                  </div>
+                </div>
+                <div style="text-align:right;">
+                  <div style="font-weight:700; color:#38bdf8; font-size:0.85rem;">${{a.count}} likes</div>
+                  <div style="font-size:0.7rem; color:var(--muted);">${{a.percentage}}% share</div>
+                </div>
+              </div>
+              <div style="background:rgba(255,255,255,0.06); height:4px; border-radius:2px; margin:8px 0 6px; overflow:hidden;">
+                <div style="background:linear-gradient(90deg, #1d9bf0, #818cf8); height:100%; width:${{Math.min(a.percentage * 8, 100)}}%;"></div>
+              </div>
+              <div style="display:flex; justify-content:space-between; align-items:center; font-size:0.72rem; margin-top:4px;">
+                <div style="display:flex; gap:4px; flex-wrap:wrap;">
+                  ${{(a.top_tags || []).map(t => `<span class="hud-tag" style="font-size:0.65rem; padding:1px 5px;" onclick="event.stopPropagation(); filterTag('${{t}}')">${{t}}</span>`).join('')}}
+                </div>
+                <button class="hud-btn" style="padding:2px 8px; font-size:0.7rem; height:24px; min-height:24px;" onclick="event.stopPropagation(); filterAuthor('${{cleanH}}')">🔍 Filter</button>
+              </div>
+            </div>
+          `;
+        }}).join('');
+      }} catch (e) {{
+        container.innerHTML = '<p style="color:var(--danger); text-align:center; padding:1rem;">Failed to load creator leaderboard.</p>';
+      }}
     }}
 
     async function loadHistoryLogs() {{
@@ -2172,34 +3543,6 @@ async def index():
       loadNotifications();
     }}
 
-    async function toggleAutoSync() {{
-      const res = await fetch('/api/scheduler/toggle', {{ method: 'POST' }});
-      const data = await res.json();
-      isSyncEnabled = data.enabled;
-      nextSyncSeconds = data.status.next_sync_in_sec || syncInterval;
-      const statusEl = document.getElementById('setting-auto-sync-status');
-      if (statusEl) statusEl.innerText = isSyncEnabled ? 'ON' : 'OFF';
-      const btn = document.getElementById('setting-auto-sync-btn');
-      if (btn) {{
-        if (isSyncEnabled) btn.classList.add('active');
-        else btn.classList.remove('active');
-      }}
-    }}
-
-    async function changeSyncInterval(val) {{
-      const sec = parseInt(val);
-      syncInterval = sec;
-      const res = await fetch('/api/scheduler/interval', {{
-        method: 'POST',
-        headers: {{ 'Content-Type': 'application/json' }},
-        body: JSON.stringify({{ interval_sec: sec }})
-      }});
-      const data = await res.json();
-      nextSyncSeconds = data.scheduler.next_sync_in_sec || sec;
-      const sel = document.getElementById('setting-interval');
-      if (sel) sel.value = val;
-    }}
-
     async function toggleAutoUnlike() {{
       const res = await fetch('/api/settings/auto-unlike/toggle', {{ method: 'POST' }});
       const data = await res.json();
@@ -2217,6 +3560,59 @@ async def index():
       const res = await fetch('/api/maintenance/unlike-synced', {{ method: 'POST' }});
       const data = await res.json();
       alert(data.message);
+    }}
+
+    async function startBulkUnbookmark() {{
+      if (!confirm('Clean and remove all synced bookmarks on Twitter/X? Local database will remain safe.')) return;
+      const res = await fetch('/api/maintenance/unbookmark-synced', {{ method: 'POST' }});
+      const data = await res.json();
+      alert(data.message);
+    }}
+
+    function startGhostLikesSweep() {{
+      if (!confirm('Start purging ghost and phantom likes against X legacy backend clusters? This will not affect your local archive.')) return;
+      const toast = document.getElementById('floating-sync-toast');
+      const toastTitle = document.getElementById('toast-title');
+      const toastDetail = document.getElementById('toast-status-detail');
+      const toastFill = document.getElementById('toast-progress-fill');
+      const toastPercent = document.getElementById('toast-percent');
+      const toastLog = document.getElementById('toast-log');
+
+      toast.style.display = 'block';
+      toastTitle.innerText = '👻 Purging Ghost Likes...';
+      toastDetail.innerText = 'Starting dual GraphQL + REST ghost sweep...';
+      toastLog.innerHTML = '<div>[Ghost Sweeper] Initializing purge against X legacy clusters...</div>';
+      toastFill.style.width = '10%';
+      toastPercent.innerText = '10%';
+
+      const es = new EventSource('/api/maintenance/ghost-sweep/stream?limit=100');
+      es.onmessage = function(e) {{
+        const data = JSON.parse(e.data);
+        if (data.stage === 'start') {{
+          toastDetail.innerText = `Sweeping ${{data.total}} historical like candidates...`;
+          toastLog.innerHTML += `<div>Starting sweep for ${{data.total}} items...</div>`;
+        }} else if (data.stage === 'ghost_sweeping') {{
+          const pct = Math.min(95, Math.round((data.current / data.total) * 100));
+          toastFill.style.width = pct + '%';
+          toastPercent.innerText = pct + '%';
+          toastDetail.innerText = `Purged #${{data.current}}/${{data.total}} (${{data.purged_count}} cleared)`;
+          toastLog.innerHTML += `<div>[${{data.method}}] ID: ${{data.tweet_id}} -> ${{data.success ? 'PURGED' : 'SKIPPED'}}</div>`;
+          toastLog.scrollTop = toastLog.scrollHeight;
+        }} else if (data.stage === 'complete') {{
+          toastFill.style.width = '100%';
+          toastPercent.innerText = '100%';
+          toastTitle.innerText = 'Ghost Purge Complete!';
+          toastDetail.innerText = data.message;
+          toastLog.innerHTML += `<div style="color:#10b981; font-weight:bold;">[DONE] ${{data.message}}</div>`;
+          es.close();
+          refreshStats();
+          setTimeout(() => {{ toast.style.display = 'none'; }}, 5000);
+        }}
+      }};
+      es.onerror = function() {{
+        toastTitle.innerText = 'Ghost Purge Ended';
+        es.close();
+      }};
     }}
 
     async function saveCookiesAuth() {{
@@ -2244,14 +3640,115 @@ async def index():
       formData.append('file', file);
       const res = await fetch('/api/ingest/archive', {{ method: 'POST', body: formData }});
       const data = await res.json();
-      if (res.ok) {{ alert(`Imported ${{data.parsed}} likes from archive!`); searchCache.clear(); refreshStats(); loadLikes(false); }}
+      if (res.ok) {{ alert(`Imported ${{data.parsed}} items (${{data.source}}) from archive!`); searchCache.clear(); refreshStats(); loadLikes(false); }}
       else {{ alert('Import failed.'); }}
     }}
 
-    async function exportMarkdown() {{
-      const res = await fetch('/api/export/markdown', {{ method: 'POST' }});
+    async function uploadYouTubeTakeout(input) {{
+      if (!input.files || !input.files[0]) return;
+      const file = input.files[0];
+      const formData = new FormData();
+      formData.append('file', file);
+      const res = await fetch('/api/ingest/youtube/takeout', {{ method: 'POST', body: formData }});
       const data = await res.json();
-      alert(`Exported ${{data.exported_count}} tweets to ${{data.export_dir}}!`);
+      if (res.ok) {{
+        alert(`Imported ${{data.parsed}} YouTube liked videos!`);
+        searchCache.clear();
+        refreshStats();
+        loadLikes(false);
+      }} else {{
+        alert('YouTube Takeout import failed.');
+      }}
+    }}
+
+    function seekYouTubePlayer(seconds) {{
+      const iframe = document.getElementById('youtube-modal-iframe');
+      if (iframe && activeModalTweet) {{
+        const vidId = activeModalTweet.tweet_id.replace(/^yt_/, '');
+        iframe.src = `https://www.youtube-nocookie.com/embed/${{vidId}}?autoplay=1&start=${{Math.floor(seconds)}}`;
+      }}
+    }}
+
+    async function ingestYtDlpUrl() {{
+      const input = document.getElementById('ytdlp-url-input');
+      const url = input ? input.value.trim() : '';
+      if (!url) {{
+        alert('Please enter a YouTube video or playlist URL.');
+        return;
+      }}
+
+      showToast('🎬 Ingesting YouTube URL via yt-dlp...', 'info');
+      try {{
+        const res = await fetch('/api/youtube/ingest-url', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ url: url }})
+        }});
+        const data = await res.json();
+        if (res.ok) {{
+          showToast(`✅ Extracted & indexed ${{data.count}} YouTube items with transcripts!`, 'success');
+          input.value = '';
+          searchCache.clear();
+          refreshStats();
+          loadLikes(false);
+        }} else {{
+          showToast(`❌ Error: ${{data.detail || 'Extraction failed'}}`, 'error');
+        }}
+      }} catch (e) {{
+        showToast('❌ Network error during yt-dlp extraction.', 'error');
+      }}
+    }}
+
+    function startBatchFetchTranscripts() {{
+      const toast = document.getElementById('floating-sync-toast');
+      const toastTitle = document.getElementById('toast-title');
+      const toastDetail = document.getElementById('toast-status-detail');
+      const toastFill = document.getElementById('toast-progress-fill');
+      const toastPercent = document.getElementById('toast-percent');
+      const toastLog = document.getElementById('toast-log');
+
+      toast.style.display = 'block';
+      toastTitle.innerText = '⚡ Fetching YouTube Transcripts...';
+      toastDetail.innerText = 'Connecting to yt-dlp transcript engine...';
+      toastLog.innerHTML = '<div>[yt-dlp] Scanning database for YouTube items missing transcripts...</div>';
+      toastFill.style.width = '10%';
+      toastPercent.innerText = '10%';
+
+      const es = new EventSource('/api/youtube/fetch-transcripts/stream');
+      es.onmessage = function(e) {{
+        const data = JSON.parse(e.data);
+        if (data.stage === 'start') {{
+          toastDetail.innerText = `Extracting transcripts for ${{data.total}} videos...`;
+          toastLog.innerHTML += `<div>Found ${{data.total}} videos needing transcripts.</div>`;
+        }} else if (data.stage === 'fetching') {{
+          const pct = Math.min(95, Math.round((data.current / data.total) * 100));
+          toastFill.style.width = pct + '%';
+          toastPercent.innerText = pct + '%';
+          toastDetail.innerText = `Processed #${{data.current}}/${{data.total}}`;
+          toastLog.innerHTML += `<div>[yt-dlp] Extracted captions for ${{data.video_id}}</div>`;
+          toastLog.scrollTop = toastLog.scrollHeight;
+        }} else if (data.stage === 'complete') {{
+          toastFill.style.width = '100%';
+          toastPercent.innerText = '100%';
+          toastTitle.innerText = 'Transcript Sync Complete!';
+          toastDetail.innerText = data.message;
+          toastLog.innerHTML += `<div style="color:#10b981; font-weight:bold;">[DONE] ${{data.message}}</div>`;
+          es.close();
+          searchCache.clear();
+          refreshStats();
+          setTimeout(() => {{ toast.style.display = 'none'; }}, 5000);
+        }}
+      }};
+      es.onerror = function() {{
+        toastTitle.innerText = 'Transcript Sync Ended';
+        es.close();
+      }};
+    }}
+
+    async function exportMarkdown() {{
+      const res = await fetch('/api/export/markdown?source=' + currentSource, {{ method: 'POST' }});
+      const data = await res.json();
+      alert(`Exported ${{data.exported_count}} items (${{data.source}}) to ${{data.export_dir}}!`);
     }}
 
     function updateSimilarLimit(val) {{
@@ -2271,9 +3768,154 @@ async def index():
       }});
     }}
 
+    function showToast(msg, type = 'info') {{
+      let container = document.getElementById('toast-container');
+      if (!container) {{
+        container = document.createElement('div');
+        container.id = 'toast-container';
+        container.className = 'toast-container';
+        document.body.appendChild(container);
+      }}
+      const toast = document.createElement('div');
+      toast.className = `toast toast--${{type}}`;
+      toast.innerHTML = `<span>${{msg}}</span><button class="toast__close" onclick="this.parentElement.remove()">×</button>`;
+      container.appendChild(toast);
+      setTimeout(() => {{
+        toast.style.opacity = '0';
+        toast.style.transform = 'translateX(100%)';
+        setTimeout(() => toast.remove(), 300);
+      }}, 3500);
+    }}
+
+    function toggleZenMode(forceState, silent = false) {{
+      const isZen = typeof forceState === 'boolean' ? forceState : !document.body.classList.contains('workspace-fullscreen--zen');
+      document.body.classList.toggle('workspace-fullscreen--zen', isZen);
+      localStorage.setItem('hud_zen_mode', isZen ? 'true' : 'false');
+
+      const btnZen = document.getElementById('btn-toggle-zen');
+      if (btnZen) btnZen.classList.toggle('active', isZen);
+
+      if (!silent) {{
+        if (isZen) {{
+          showToast('✨ Zen Mode: All widgets hidden (Press Z or Esc to restore)', 'info');
+        }} else {{
+          showToast('👁️ Restored UI Widgets', 'info');
+        }}
+      }}
+    }}
+
+    /* Mobile Pull-to-Refresh Engine */
+    let touchStartY = 0;
+    let touchMoveY = 0;
+    let isPulling = false;
+
+    window.addEventListener('touchstart', (e) => {{
+      if (window.scrollY <= 0 && e.touches.length === 1) {{
+        touchStartY = e.touches[0].clientY;
+        isPulling = true;
+      }} else {{
+        isPulling = false;
+      }}
+    }}, {{ passive: true }});
+
+    window.addEventListener('touchmove', (e) => {{
+      if (!isPulling) return;
+      touchMoveY = e.touches[0].clientY;
+      const pullDist = touchMoveY - touchStartY;
+      const indicator = document.getElementById('hud-pull-indicator');
+      if (pullDist > 10 && window.scrollY <= 0) {{
+        if (indicator) {{
+          indicator.classList.add('pulling');
+          const clamped = Math.min(pullDist * 0.4, 50);
+          indicator.style.transform = `translateX(-50%) translateY(${{clamped}}px) rotate(${{pullDist * 2}}deg)`;
+        }}
+      }}
+    }}, {{ passive: true }});
+
+    window.addEventListener('touchend', () => {{
+      if (!isPulling) return;
+      const pullDist = touchMoveY - touchStartY;
+      const indicator = document.getElementById('hud-pull-indicator');
+      if (pullDist > 65 && window.scrollY <= 0) {{
+        if (indicator) {{
+          indicator.classList.remove('pulling');
+          indicator.classList.add('refreshing');
+          indicator.style.transform = '';
+        }}
+        showToast('🔄 Refreshing feed & telemetry...', 'info');
+        searchCache.clear();
+        refreshStats();
+        loadLikes(false);
+        setTimeout(() => {{
+          if (indicator) {{
+            indicator.classList.remove('refreshing');
+            indicator.style.transform = '';
+          }}
+        }}, 800);
+      }} else if (indicator) {{
+        indicator.classList.remove('pulling');
+        indicator.style.transform = '';
+      }}
+      isPulling = false;
+      touchStartY = 0;
+      touchMoveY = 0;
+    }}, {{ passive: true }});
+
+    /* Mobile Bottom Sheet Swipe-to-Dismiss Gesture */
+    function initMobileSwipeToDismiss(elementId, closeFn) {{
+      const el = document.getElementById(elementId);
+      if (!el) return;
+      let startY = 0;
+      let currentY = 0;
+      let isDragging = false;
+
+      el.addEventListener('touchstart', (e) => {{
+        if (window.innerWidth > 768) return;
+        const box = el.querySelector('.hud-modal-box') || el;
+        if (box.scrollTop > 5) return;
+        startY = e.touches[0].clientY;
+        isDragging = true;
+      }}, {{ passive: true }});
+
+      el.addEventListener('touchmove', (e) => {{
+        if (!isDragging) return;
+        currentY = e.touches[0].clientY;
+        const diff = currentY - startY;
+        if (diff > 0) {{
+          const box = el.querySelector('.hud-modal-box') || el;
+          box.style.transform = `translateY(${{diff}}px)`;
+          box.style.transition = 'none';
+        }}
+      }}, {{ passive: true }});
+
+      el.addEventListener('touchend', () => {{
+        if (!isDragging) return;
+        const diff = currentY - startY;
+        const box = el.querySelector('.hud-modal-box') || el;
+        box.style.transition = 'transform 0.25s cubic-bezier(0.4, 0, 0.2, 1)';
+        if (diff > 90) {{
+          box.style.transform = 'translateY(100%)';
+          setTimeout(() => {{
+            closeFn();
+            box.style.transform = '';
+          }}, 200);
+        }} else {{
+          box.style.transform = '';
+        }}
+        isDragging = false;
+        startY = 0;
+        currentY = 0;
+      }}, {{ passive: true }});
+    }}
+
     window.addEventListener('DOMContentLoaded', () => {{
       applyLayout();
       renderTagCloud();
+      initMobileSwipeToDismiss('hud-tweet-modal', closeTweetModal);
+      const savedZen = localStorage.getItem('hud_zen_mode') === 'true';
+      if (savedZen) {{
+        toggleZenMode(true, true);
+      }}
       const savedTagLimit = localStorage.getItem('hud_top_tags_limit') || '10';
       const tagLimitSelect = document.getElementById('setting-top-tags-count');
       if (tagLimitSelect) tagLimitSelect.value = savedTagLimit;
@@ -2284,6 +3926,8 @@ async def index():
       if (similarLimitSelect) similarLimitSelect.value = savedSimilarLimit;
       const sortSelect = document.getElementById('select-sort');
       if (sortSelect) sortSelect.value = currentSort;
+      const engineSelect = document.getElementById('select-engine');
+      if (engineSelect) engineSelect.value = currentEngine;
       loadLikes(false);
       setTimeout(prefetchTopTags, 500);
     }});

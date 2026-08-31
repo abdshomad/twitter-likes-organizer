@@ -12,11 +12,11 @@ class RAGChatEngine:
     def __init__(self, store: LanceDBStore, embedder: VectorEmbedder):
         self.store = store
         self.embedder = embedder
-        self.client = httpx.AsyncClient(timeout=60.0)
+        self.client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=1.0))
 
     async def get_available_model(self) -> str:
         try:
-            res = await self.client.get("http://127.0.0.1:11434/api/tags", timeout=2.0)
+            res = await self.client.get("http://127.0.0.1:11434/api/tags", timeout=1.0)
             if res.status_code == 200:
                 models = [m["name"] for m in res.json().get("models", [])]
                 for preferred in ["gemma4:latest", "qwen3.6:latest", "qwen3-coder:30b", "test:latest"]:

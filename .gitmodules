@@ -7,3 +7,6 @@
 [submodule "hud-design"]
 	path = hud-design
 	url = https://github.com/abdshomad/hud-design.git
+[submodule "meilisearch"]
+	path = meilisearch
+	url = https://github.com/meilisearch/meilisearch.git

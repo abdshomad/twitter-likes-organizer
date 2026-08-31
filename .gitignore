@@ -38,3 +38,5 @@ like.js
 # Runtime & Process artifacts
 *.pid
 *.log
+bin/
+data.ms/

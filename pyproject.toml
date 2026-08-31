@@ -14,6 +14,7 @@ dependencies = [
     "httpx>=0.28.1",
     "jinja2>=3.1.6",
     "lancedb>=0.37.1",
+    "meilisearch>=0.43.0",
     "playwright>=1.62.0",
     "pyarrow>=25.0.1",
     "python-dotenv>=1.2.3",
